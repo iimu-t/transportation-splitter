@@ -38,7 +38,7 @@ def main():
     )
     AND theme = 'transportation'
     AND type = 'segment'
-    AND subtype = 'rail'
+    AND subtype = 'road'
     ORDER BY id ASC
     LIMIT 100;
     """

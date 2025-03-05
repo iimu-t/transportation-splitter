@@ -16,6 +16,7 @@ pyspark = [
     {version = "^3.5", python = "3.11"},
 ]
 apache-sedona = "^1.7"
+shapely = "^2.0.7"
 
 [tool.poetry.group.test.dependencies]
 pytest = ">=8"

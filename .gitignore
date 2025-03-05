@@ -106,5 +106,5 @@ dist
 .tern-port
 
 .venv
-
+log.txt
 __pycache__
