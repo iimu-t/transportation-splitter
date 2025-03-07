@@ -5,6 +5,7 @@ import boto3
 from shapely import wkt
 from tqdm import tqdm
 import pandas as pd
+from pyspark.sql import SparkSession
 
 # 各種の設定
 workgroup = "dev-land-idata"
@@ -14,8 +15,19 @@ data_base = "release"
 data_sorce = "overture"
 session = boto3.Session(profile_name=profile_name, region_name=athena_region)
 
+def query_overture_with_wrangler(query: str, session: boto3.Session, data_base: str, data_sorce: str, workgroup: str):
+    df = wr.athena.read_sql_query(
+        sql=query,
+        database=data_base,
+        data_source=data_sorce,
+        boto3_session=session,
+        workgroup=workgroup,
+        ctas_approach=False,
+    )
+    return df
+
 def main():
-    # ハードコーディングされたS3出力パス
+    # ハードコーディングされたS3出力パス（"s3://"で始まる）
     output_path = "s3://overturemaps-data/splitter_output/"
 
     # 直接定義したポリゴンのWKT文字列
@@ -43,7 +55,7 @@ def main():
     LIMIT 100;
     """
 
-    # Athenaからデータ取得
+    # Athenaからデータ取得（session, data_base, data_sorce, workgroupは適切に定義されている前提）
     df = query_overture_with_wrangler(
         query=query,
         session=session,
@@ -63,23 +75,25 @@ def main():
 
     # awswranglerを利用してS3にParquet形式で保存
     wr.s3.to_parquet(
-        df=df,
-        path=output_path,
-        dataset=True,
-        mode="overwrite"
+    df=df,
+    path=output_path,
+    dataset=True,
+    mode="overwrite",
+    index=False
     )
     print(f"データは {output_path} にParquet形式で保存されました。")
 
-def query_overture_with_wrangler(query: str, session: boto3.Session, data_base: str, data_sorce: str, workgroup: str):
-    df = wr.athena.read_sql_query(
-        sql=query,
-        database=data_base,
-        data_source=data_sorce,
-        boto3_session=session,
-        workgroup=workgroup,
-        ctas_approach=False,
-    )
-    return df
+    # SparkSession作成時に、s3スキームの設定を追加
+    spark = SparkSession.builder \
+        .appName("Transportation Splitter") \
+        .config("fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+        .config("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+        .getOrCreate()
+
+    # 出力されたParquetファイルをSparkで読み込み、スキーマを表示
+    parquet_df = spark.read.parquet(output_path)
+    parquet_df.printSchema()
+
 
 if __name__ == "__main__":
     main()
