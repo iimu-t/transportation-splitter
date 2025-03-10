@@ -21,6 +21,8 @@ from typing import Optional, Any, Callable
 from dataclasses import dataclass, field
 import traceback
 import os
+from pyspark.sql.functions import to_json, col, lit, explode, size
+from pyspark.sql.types import StringType
 
 PROHIBITED_TRANSITIONS_COLUMN = "prohibited_transitions"
 DESTINATIONS_COLUMN = "destinations"
@@ -1096,6 +1098,17 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
 
     print(f"filtered_df.count() = {str(filtered_df.count())}")
 
+    # ---【追加】destinationsカラムが文字列の場合、正しいJSON形式に変換してパースする ---
+    if DESTINATIONS_COLUMN in filtered_df.columns:
+        from pyspark.sql.functions import regexp_replace, from_json
+        # 例として、以下のようにキーにダブルクォートを付ける処理を実施
+        fixed_destinations = regexp_replace(col(DESTINATIONS_COLUMN), r"(\w+)=\{", r'"\1":{')
+        fixed_destinations = regexp_replace(fixed_destinations, r"(\w+)=\[", r'"\1":[')
+        fixed_destinations = regexp_replace(fixed_destinations, r"(\w+)=([^,\]\}]+)", r'"\1":"\2"')
+        # ※入力例によってはさらに調整が必要な場合があります
+        filtered_df = filtered_df.withColumn(DESTINATIONS_COLUMN, from_json(fixed_destinations, resolved_destinations_schema))
+    # ---【ここまで追加】---
+
     lr_columns_for_splitting = get_filtered_columns(get_columns_with_struct_field_name(filtered_df, LR_SCOPE_KEY), cfg.lr_columns_to_include, cfg.lr_columns_to_exclude)
     print("lr_columns_for_splitting: ")
     print(lr_columns_for_splitting)
@@ -1125,7 +1138,8 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
     print("split_segments_df")
 
     flat_res_df = split_segments_df.select("input_segment", "split_result.*")
-    
+    print(flat_res_df.columns)
+
     print("total length stats")
     flat_res_df.select(
         F.sum("length_before_split").cast("int").alias("total_length_before_split"),
@@ -1144,22 +1158,39 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
         wrangler.write(flat_splits_df, SplitterStep.segment_splits_exploded)
 
     added_connectors_df = flat_res_df.select("added_connectors_rows")
+    # ----修正----
+    added_connectors_df = flat_res_df.filter(size("added_connectors_rows") > 0) \
+        .select("added_connectors_rows") \
+        .withColumn("connector", F.explode("added_connectors_rows")) \
+        .select("connector.*") \
+        .withColumn("connectors", F.lit(None).cast(StringType()))
 
-    from pyspark.sql.functions import to_json, col
-    # ----修正----
-    added_connectors_df = flat_res_df.filter(size("added_connectors_rows") > 0)\
-        .withColumn("added_connectors_json", to_json(col("added_connectors_rows")))\
-        .selectExpr("CAST(added_connectors_json AS string) as added_connectors")
-    # ----修正----
     #added_connectors_df = flat_res_df.filter(size("added_connectors_rows") > 0).select("added_connectors_rows").withColumn("connector", F.explode("added_connectors_rows")).select("connector.*")
-
+    # ----修正----
     final_segments_df = wrangler.read(spark, SplitterStep.segment_splits_exploded)
 
     # Output error count, example errors and split stats to identify potential issues
     final_segments_df.groupBy("is_success", coalesce(element_at(split(final_segments_df["error_message"], ":"), 1), "error_message")).agg(count("*").alias("count")).show(20, False)
     final_segments_df.groupBy("id").agg(count("*").alias("number_of_splits")).groupBy("number_of_splits").agg(count("*")).orderBy("number_of_splits").show()
 
-    all_connectors_df = filtered_df.filter("type == 'connector'").unionByName(added_connectors_df).select(filtered_df.columns)
+    # ----追加----
+    # filtered_connectors_df では "connectors" カラムを JSON 文字列に変換
+    filtered_connectors_df = filtered_df.filter("type == 'connector'") \
+        .withColumn("connectors", to_json(col("connectors")))
+
+    # added_connectors_df も同様に "connectors" を文字列にする（ここでは元々 None になっているので、明示的に文字列型にキャスト）
+    added_connectors_df = flat_res_df.filter(size("added_connectors_rows") > 0) \
+        .select("added_connectors_rows") \
+        .withColumn("connector", explode("added_connectors_rows")) \
+        .select("connector.*") \
+        .withColumn("connectors", lit(None).cast(StringType()))
+
+    # 両方の DataFrame のスキーマが一致するように、たとえば filtered_connectors_df のカラム順に合わせる
+    all_connectors_df = filtered_connectors_df.unionByName(added_connectors_df) \
+        .select(filtered_connectors_df.columns)
+    # ----追加----
+
+    #all_connectors_df = filtered_df.filter("type == 'connector'").unionByName(added_connectors_df).select(filtered_df.columns)
     if PROHIBITED_TRANSITIONS_COLUMN in final_segments_df.columns:
         final_segments_df = resolve_tr_references(final_segments_df)
 
@@ -1184,6 +1215,7 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
         
     return loaded_final_df
 
+'''
 # COMMAND ----------
 if 'spark' in globals():
     overture_release_version = "2024-11-13.0"
@@ -1209,7 +1241,7 @@ if 'spark' in globals():
         display(result_df.filter('type == "segment"').limit(50))
     else:
         result_df.filter('type == "segment"').show(20, False)
-
+'''
 from pyspark.sql.functions import from_json
 from pyspark.sql.types import ArrayType, StructType, StructField, StringType, DoubleType
 import argparse
