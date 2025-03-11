@@ -107,4 +107,5 @@ dist
 
 .venv
 log.txt
+output.geojson
 __pycache__
