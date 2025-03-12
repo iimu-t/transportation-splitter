@@ -7,8 +7,8 @@ import numpy as np
 np.object = object
 
 # 定数
-S3_INPUT_PATH = "s3://overturemaps-data/splitter_results_final/part-00000-98283570-31e0-40a7-8cd7-134dbed28e31-c000.zstd.parquet"
-#S3_INPUT_PATH = "s3://overturemaps-data/splitter_output/4a7fdf5fae194aa0a52a5520aa70d0d8.snappy.parquet"
+#S3_INPUT_PATH = "s3://overturemaps-data/splitter_results_final/part-00000-15ef8cb2-0ecf-45d2-8a49-bfc08714972d-c000.zstd.parquet"
+S3_INPUT_PATH = "s3://overturemaps-data/splitter_output/5ec99570ba4945ee81bf1ac4e3b48ad9.snappy.parquet"
 OUTPUT_GEOJSON = "./output.geojson"
 
 def main():
