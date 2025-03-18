@@ -955,8 +955,43 @@ def resolve_tr_references(result_df):
     referenced_splits_info_df = referenced_segment_ids_df.join(
         result_df,
         result_df.id == referenced_segment_ids_df.referenced_segment_id,
-        "inner").select(col("id").alias("ref_id"), col("start_lr").alias("ref_start_lr"), col("end_lr").alias("ref_end_lr"), col("connectors").alias("ref_connectors"))
+        "inner"
+    ).select(
+        col("id").alias("ref_id"),
+        col("start_lr").alias("ref_start_lr"),
+        col("end_lr").alias("ref_end_lr"),
+        col("connectors").alias("ref_connectors")
+    )
 
+    # ---- 修正 ----
+    ref_joined_df = splits_w_trs_df.alias("trs").join(
+        referenced_splits_info_df.alias("ref"),
+        F.col("trs.segment_id") == F.col("ref.ref_id"),
+        "inner"
+    ).select(
+        # ↓ ここで “id” を拾っておかないと後で参照できない
+        F.col("trs.id").alias("id"),
+
+        # ここで必要になるカラムをすべて alias しておく
+        F.col("trs.segment_id").alias("segment_id"),
+        F.col("trs.start_lr").alias("start_lr"),
+        F.col("trs.end_lr").alias("end_lr"),
+
+        # turn_restrictions の展開で出てくる中間情報
+        F.col("trs.connector_id"),
+        F.col("trs.next_connector_id"),
+        F.col("trs.final_heading"),
+        F.col("trs.tr_index"),
+        F.col("trs.sequence_index"),
+
+        # 参照先のスプリット情報
+        F.col("ref.ref_id"),
+        F.col("ref.ref_start_lr"),
+        F.col("ref.ref_end_lr"),
+        F.col("ref.ref_connectors")
+    )
+
+    '''
     ref_joined_df = splits_w_trs_df.join(
         referenced_splits_info_df,
         splits_w_trs_df.segment_id == referenced_splits_info_df.ref_id,
@@ -965,6 +1000,8 @@ def resolve_tr_references(result_df):
         splits_w_trs_df["*"],
         referenced_splits_info_df["*"]
     ).drop("segment_id")
+    '''
+    # ---- 修正 ----
 
     # if next_connector_id is null then it's the last reference in the sequence - in this case final_heading is used - if forward then the referenced connector id is expected to be the first, if backward then second
     # if it's not the last in the sequence, then we need the segment to have references to both the connector in the TR for the current sequence index as well as the next sequence index - so the two connectors must be connector_id and next_connector_id, order not relevant (they could be swapped).
@@ -1014,6 +1051,127 @@ def resolve_tr_references(result_df):
     return result_trs_resolved_df
 
 def resolve_destinations_references(result_df):
+    from pyspark.sql import functions as F
+
+    # destinations を含むスプリット行だけ取り出して explode
+    splits_w_destinations_df = (
+        result_df
+        .filter(f"{DESTINATIONS_COLUMN} is not null and size({DESTINATIONS_COLUMN})>0")
+        .select("id", "start_lr", "end_lr", DESTINATIONS_COLUMN)
+        .withColumn("dr", F.explode(DESTINATIONS_COLUMN))
+        .select("*", "dr.*")
+        .drop("dr")
+    )
+
+    # 参照先の segment_id 一覧を取り出す
+    referenced_segment_ids_df = (
+        splits_w_destinations_df
+        .select(F.col("to_segment_id").alias("referenced_segment_id"))
+        .distinct()
+    )
+
+    # 参照先スプリット情報を取り出し、カラム名が被らないようリネーム
+    referenced_splits_info_df = (
+        referenced_segment_ids_df
+        .join(result_df, result_df.id == referenced_segment_ids_df.referenced_segment_id, "inner")
+        .select(
+            F.col("id").alias("ref_id"),
+            F.col("start_lr").alias("ref_start_lr"),       # リネーム
+            F.col("end_lr").alias("ref_end_lr"),           # リネーム
+            F.col("connectors").alias("ref_connectors")    # リネーム
+        )
+    )
+
+    # 元テーブル (splits_w_destinations_df) と参照先テーブル (referenced_splits_info_df) を join
+    # カラム衝突を回避するため、.alias() で両テーブルに別名を振り、select() で明示的に取得するカラムを指定
+    ref_joined_df = (
+        splits_w_destinations_df.alias("dest")
+        .join(
+            referenced_splits_info_df.alias("ref"),
+            F.col("dest.to_segment_id") == F.col("ref.ref_id"),
+            "inner"
+        )
+        .select(
+            # destination 側のカラム
+            F.col("dest.id").alias("id"),
+            F.col("dest.start_lr").alias("start_lr"),
+            F.col("dest.end_lr").alias("end_lr"),
+            F.col("dest.labels"),
+            F.col("dest.symbols"),
+            F.col("dest.from_connector_id"),
+            F.col("dest.to_segment_id"),
+            F.col("dest.to_connector_id"),
+            F.col("dest.when"),
+            F.col("dest.final_heading"),
+
+            # 参照先スプリット情報 (衝突しないよう prefix を付けたカラム名を使う)
+            F.col("ref.ref_id"),
+            F.col("ref.ref_start_lr"),
+            F.col("ref.ref_end_lr"),
+            F.col("ref.ref_connectors")
+        )
+    )
+
+    # forward/backward ごとに filter する条件式
+    referenced_split_condition = F.when(
+        F.col("final_heading") == "forward",
+        F.expr("ref_connectors[0].connector_id = to_connector_id")
+    ).otherwise(
+        F.expr("ref_connectors[1].connector_id = to_connector_id")
+    )
+
+    # filter 後に必要な項目だけ struct 化
+    destination_refs_resolved_df = (
+        ref_joined_df
+        .filter(referenced_split_condition)
+        .select(
+            F.col("id").alias("from_id"),
+            F.col("start_lr").alias("from_start_lr"),
+            F.col("end_lr").alias("from_end_lr"),
+            F.struct(
+                "labels",
+                "symbols",
+                "from_connector_id",
+                "to_segment_id",
+                # ↓ 先に LR を入れる
+                F.col("ref_start_lr").alias("to_segment_start_lr"),
+                F.col("ref_end_lr").alias("to_segment_end_lr"),
+                # そのあと connector_id
+                "to_connector_id",
+                "when",
+                "final_heading"
+            ).alias("d")
+        )
+    )
+
+    # groupBy してまとめる
+    destination_refs_resolved_agg_df = (
+        destination_refs_resolved_df
+        .groupBy("from_id", "from_start_lr", "from_end_lr")
+        .agg(F.collect_list("d").alias(f"{DESTINATIONS_COLUMN}_resolved"))
+    )
+
+    # 元のデータに left join で紐づけ、カラム名を戻す
+    result_w_destinations_resolved_df = (
+        result_df.drop(DESTINATIONS_COLUMN)
+        .join(
+            destination_refs_resolved_agg_df,
+            (
+                (result_df.id == destination_refs_resolved_agg_df.from_id) &
+                (result_df.start_lr == destination_refs_resolved_agg_df.from_start_lr) &
+                (result_df.end_lr == destination_refs_resolved_agg_df.from_end_lr)
+            ),
+            "left"
+        )
+        .drop("from_id", "from_start_lr", "from_end_lr")
+        .withColumnRenamed(f"{DESTINATIONS_COLUMN}_resolved", DESTINATIONS_COLUMN)
+    )
+
+    return result_w_destinations_resolved_df
+
+# ---- 修正 ----
+'''
+def resolve_destinations_references(result_df):
     splits_w_destinations_df = result_df.filter(f"{DESTINATIONS_COLUMN} is not null and size({DESTINATIONS_COLUMN})>0").select("id", "start_lr", "end_lr", DESTINATIONS_COLUMN).withColumn("dr", F.explode(DESTINATIONS_COLUMN)).select("*", "dr.*").drop("dr")
 
     referenced_segment_ids_df = splits_w_destinations_df.select(col("to_segment_id").alias("referenced_segment_id")).distinct()
@@ -1050,6 +1208,8 @@ def resolve_destinations_references(result_df):
         "left").drop("from_id", "from_start_lr", "from_end_lr").withColumnRenamed(f"{DESTINATIONS_COLUMN}_resolved", DESTINATIONS_COLUMN)
     
     return result_w_destinations_resolved_df
+'''
+# ---- 修正 ----
 
 def get_aggregated_metrics(result_df):
     segments_df = result_df.filter("type='segment'")
@@ -1151,20 +1311,25 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
 
     # ---- 修正----
     #all_connectors_df = filtered_df.filter("type == 'connector'").unionByName(added_connectors_df).select(filtered_df.columns)
-    all_connectors_df = filtered_df.filter("type == 'connector'") \
-        .select(filtered_df.columns) \
+    all_connectors_df = (
+        # まず type=connector の行を取り出し、
+        # connectors を array<struct<connector_id:string,at:double>> にキャストしておく
+        filtered_df.filter("type == 'connector'")
+            .select([
+                col(c).cast("array<struct<connector_id:string,at:double>>") if c == "connectors"
+                else col(c)
+                for c in filtered_df.columns
+            ])
+
+        # 追加生成したコネクタ行とも union
         .unionByName(
-            added_connectors_df.select(
-                *[
-                    # "connectors" 列は文字列型にキャスト
-                    col(c).cast("string") if c == "connectors" 
-                    # "destinations" 列は最終スキーマに合わせる（ここでは後でキャストするため、ここではそのまま残すか削除）
-                    # 例として、不要なら else col(c) でそのままにする
-                    else col(c)
-                    for c in filtered_df.columns
-                ]
-            )
+            added_connectors_df.select([
+                col(c).cast("array<struct<connector_id:string,at:double>>") if c == "connectors"
+                else col(c)
+                for c in filtered_df.columns
+            ])
         )
+    )
     # ---- 修正----
     if PROHIBITED_TRANSITIONS_COLUMN in final_segments_df.columns:
         final_segments_df = resolve_tr_references(final_segments_df)
@@ -1179,20 +1344,20 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
     extra_columns = [field.name for field in additional_fields_in_split_segments if field.name != "turn_restrictions"]    
     for extra_col in extra_columns:
         all_connectors_df = all_connectors_df.withColumn(extra_col, lit(None))
-    # ---- 修正----
-    final_segments_cast = final_segments_df.select([
-        col(c) if c != DESTINATIONS_COLUMN else col(c).cast(resolved_destinations_schema)
-        for c in final_segments_df.columns
-    ] + extra_columns)
 
-    all_connectors_cast = all_connectors_df.select([
-        col(c) if c != DESTINATIONS_COLUMN else col(c).cast(resolved_destinations_schema)
-        for c in all_connectors_df.columns
-    ])
+    # ----修正----
+    from pyspark.sql.functions import lit
+    # 既存の "connectors" (文字列型) カラムを先に削除
+    all_connectors_df = all_connectors_df.drop("connectors")
 
-    final_df = final_segments_cast.unionByName(all_connectors_cast)
-    #final_df = final_segments_df.select(filtered_df.columns + extra_columns).unionByName(all_connectors_df)
-    # ---- 修正----
+    # 改めて “配列型” の connectors カラムを追加
+    all_connectors_df = all_connectors_df.withColumn(
+        "connectors",
+        lit(None).cast("array<struct<connector_id:string,at:double>>")
+    )
+    # ----修正----
+    final_df = final_segments_df.select(filtered_df.columns + extra_columns).unionByName(all_connectors_df)
+
     wrangler.write(final_df, SplitterStep.final_output)
     loaded_final_df = wrangler.read(spark, SplitterStep.final_output)
     loaded_final_df.groupBy("type").agg(count("*").alias("count")).show()
