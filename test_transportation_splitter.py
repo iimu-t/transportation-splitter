@@ -21,6 +21,11 @@ from typing import Optional, Any, Callable
 from dataclasses import dataclass, field
 import traceback
 import os
+from pyspark.sql.functions import when, array
+from pyspark.sql.functions import from_json
+from pyspark.sql.types import ArrayType, StructType, StructField, StringType, DoubleType
+import argparse
+from sedona.spark import SedonaContext  # Sedonaの初期化に必要
 
 PROHIBITED_TRANSITIONS_COLUMN = "prohibited_transitions"
 DESTINATIONS_COLUMN = "destinations"
@@ -282,9 +287,17 @@ def filter_df(input_df, filter_wkt, condition_function = "ST_Intersects"):
 
 def join_segments_with_connectors(input_df):
     segments_df = input_df.filter(col("type") == "segment").withColumnRenamed("id", "segment_id")
+    # ---- 修正 ----
+    # もし segments_df に "connectors" 列が存在して文字列型なら、
+    # 空の配列として再生成して型を合わせる
+    if "connectors" in segments_df.columns:
+        segments_df = segments_df.drop("connectors").withColumn(
+            "connectors", F.expr("array()").cast("array<struct<connector_id:string,at:double>>")
+        )
+    # ---- 修正 ----
     connectors_df = input_df.filter(col("type") == "connector")\
         .withColumnRenamed("id", "connector_id")\
-        .withColumnRenamed("geometry", "connector_geometry")\
+        .withColumnRenamed("geometry", "connector_geometry")
 
     segments_with_index = segments_df.withColumn(
         "connectors_with_index",
@@ -879,6 +892,9 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
                 split_points = sorted(split_points, key=lambda p: p.lr)
                 split_points = [split_points[0], split_points[-1]]
 
+            # ---- 修正 ----
+            result_df.select("split_result.debug_messages").show(truncate=False)
+            # ---- 修正 ----
             debug_messages.append("adding lr split points...")
             lrs_set = set()
             for column in lr_columns_for_splitting:
@@ -1051,8 +1067,6 @@ def resolve_tr_references(result_df):
     return result_trs_resolved_df
 
 def resolve_destinations_references(result_df):
-    from pyspark.sql import functions as F
-
     # destinations を含むスプリット行だけ取り出して explode
     splits_w_destinations_df = (
         result_df
@@ -1233,7 +1247,6 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
     if filter_wkt is None:
         filtered_df = wrangler.read(spark, SplitterStep.read_input)
         # ---- 修正----
-        from pyspark.sql.functions import from_json
         filtered_df = filtered_df.withColumn(DESTINATIONS_COLUMN, from_json(col(DESTINATIONS_COLUMN), resolved_destinations_schema))
         # ---- 修正----
     else:
@@ -1311,24 +1324,34 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
 
     # ---- 修正----
     #all_connectors_df = filtered_df.filter("type == 'connector'").unionByName(added_connectors_df).select(filtered_df.columns)
+    # 空の配列リテラルを生成し、array<struct<connector_id:string,at:double>> 型にキャスト
+    empty_connector_array = F.expr("array()").cast("array<struct<connector_id:string,at:double>>")
+
+    # セグメント行側（final_segments_df）の connectors カラムが文字列型の場合、空の配列で上書きして正しい型に変更
+    if "connectors" in final_segments_df.columns:
+        final_segments_df = final_segments_df.drop("connectors").withColumn(
+            "connectors", F.expr("array()").cast("array<struct<connector_id:string,at:double>>")
+        )
+
+    # connector 行側のデータについては、既存の connectors カラムを空の配列リテラル (正しい型) で置換
     all_connectors_df = (
-        # まず type=connector の行を取り出し、
-        # connectors を array<struct<connector_id:string,at:double>> にキャストしておく
         filtered_df.filter("type == 'connector'")
             .select([
-                col(c).cast("array<struct<connector_id:string,at:double>>") if c == "connectors"
-                else col(c)
+                empty_connector_array.alias("connectors") if c == "connectors" else col(c)
                 for c in filtered_df.columns
             ])
-
-        # 追加生成したコネクタ行とも union
         .unionByName(
             added_connectors_df.select([
-                col(c).cast("array<struct<connector_id:string,at:double>>") if c == "connectors"
-                else col(c)
+                empty_connector_array.alias("connectors") if c == "connectors" else col(c)
                 for c in filtered_df.columns
             ])
         )
+    )
+
+    # union 後、全体の schema を揃えるために connectors カラムを一度削除して、改めて空の配列リテラルで再生成
+    all_connectors_df = all_connectors_df.drop("connectors")
+    all_connectors_df = all_connectors_df.withColumn(
+        "connectors", F.expr("array()").cast("array<struct<connector_id:string,at:double>>")
     )
     # ---- 修正----
     if PROHIBITED_TRANSITIONS_COLUMN in final_segments_df.columns:
@@ -1346,11 +1369,10 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
         all_connectors_df = all_connectors_df.withColumn(extra_col, lit(None))
 
     # ----修正----
-    from pyspark.sql.functions import lit
     # 既存の "connectors" (文字列型) カラムを先に削除
     all_connectors_df = all_connectors_df.drop("connectors")
 
-    # 改めて “配列型” の connectors カラムを追加
+    # 改めて “配列型” の connectors カラムを追加（connector 行では上記で空の配列にしている場合もこちらで上書きされる）
     all_connectors_df = all_connectors_df.withColumn(
         "connectors",
         lit(None).cast("array<struct<connector_id:string,at:double>>")
@@ -1394,11 +1416,6 @@ if 'spark' in globals():
     else:
         result_df.filter('type == "segment"').show(20, False)
 '''
-
-from pyspark.sql.functions import from_json
-from pyspark.sql.types import ArrayType, StructType, StructField, StringType, DoubleType
-import argparse
-from sedona.spark import SedonaContext  # Sedonaの初期化に必要
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Transportation Splitter")
