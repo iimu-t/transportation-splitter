@@ -5,7 +5,6 @@
 # MAGIC # AWS Glue notebook - see instructions for magic commands
 
 # COMMAND ----------
-
 from collections import deque
 from copy import deepcopy
 from enum import Enum
@@ -21,6 +20,14 @@ from typing import Optional, Any, Callable
 from dataclasses import dataclass, field
 import traceback
 import os
+from pyspark.sql.functions import when, array
+from pyspark.sql.functions import from_json
+from pyspark.sql.types import ArrayType, StructType, StructField, StringType, DoubleType
+import argparse
+from sedona.spark import SedonaContext  # Sedonaの初期化に必要
+import re  # 追加
+from pyspark.sql.functions import udf  # 追加
+from pyspark.sql.types import StructType, StructField  # 追加
 
 PROHIBITED_TRANSITIONS_COLUMN = "prohibited_transitions"
 DESTINATIONS_COLUMN = "destinations"
@@ -130,11 +137,12 @@ class SplitterDataWrangler:
 
     @staticmethod
     def read_geoparquet(spark, path, merge_schema=True, geometry_column="geometry"):
-        if SplitterDataWrangler.is_geoparquet(spark, path, geometry_column=geometry_column):
+        # geoparquet として読み込もうとするが、失敗した場合は通常の parquet として読み込む
+        try:
             return spark.read.format("geoparquet").option("mergeSchema", str(merge_schema).lower()).load(path)
-        else:
-            return spark.read.option("mergeSchema", str(merge_schema).lower()).parquet(path) \
-                .withColumn(geometry_column, expr("ST_GeomFromWKB(geometry)"))
+        except Exception as e:
+            print("geoparquet 読み取りに失敗しました。通常の parquet として読み込みます。")
+            return spark.read.option("mergeSchema", str(merge_schema).lower()).parquet(path)
 
     @staticmethod
     def write_geoparquet(df, path):
@@ -270,11 +278,43 @@ def filter_df(input_df, filter_wkt, condition_function = "ST_Intersects"):
     filter_expression = f"{condition_function}(ST_GeomFromWKT('{sanitize_wkt(filter_wkt)}'), geometry) = true"
     return input_df.filter(expr(filter_expression))
 
+# 追加: connectorsの文字列を辞書の配列にパースする関数
+def parse_connectors(s: str):
+    if not s or s.strip() == "":  # 修正: 空文字列を空の配列にする
+        return []
+    pattern = r'\{([^}]+)\}'
+    matches = re.findall(pattern, s)
+    result = []
+    for match in matches:
+        items = match.split(',')
+        item_dict = {}
+        for item in items:
+            key, val = item.split('=')
+            key = key.strip()
+            val = val.strip()
+            if key == "at":
+                try:
+                    val = float(val)
+                except:
+                    val = None
+            item_dict[key] = val
+        result.append(item_dict)
+    return result
+
+connector_schema = ArrayType(StructType([
+    StructField("connector_id", StringType(), True),
+    StructField("at", DoubleType(), True)
+]))
+parse_connectors_udf = udf(parse_connectors, connector_schema)
+
 def join_segments_with_connectors(input_df):
     segments_df = input_df.filter(col("type") == "segment").withColumnRenamed("id", "segment_id")
+    # 常にconnectors列を文字列としてパースする
+    segments_df = segments_df.withColumn("connectors", parse_connectors_udf(F.col("connectors")))
+    # 修正: "geometry" 列ではなく必ず "geometry_wkt" を使用する
     connectors_df = input_df.filter(col("type") == "connector")\
         .withColumnRenamed("id", "connector_id")\
-        .withColumnRenamed("geometry", "connector_geometry")\
+        .withColumn("connector_geometry", col("geometry_wkt"))
 
     segments_with_index = segments_df.withColumn(
         "connectors_with_index",
@@ -300,7 +340,7 @@ def join_segments_with_connectors(input_df):
         segments_connectors_exploded.connector_id,
         segments_connectors_exploded.connector_at,
         segments_connectors_exploded.connector_index,
-        connectors_df.connector_geometry
+        connectors_df["connector_geometry"]
     )
 
     # Step 3: Group by segment_id and aggregate connector information
@@ -1151,7 +1191,7 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
     get_aggregated_metrics(loaded_final_df).show()
         
     return loaded_final_df
-
+'''
 # COMMAND ----------
 if 'spark' in globals():
     overture_release_version = "2024-11-13.0"
@@ -1177,3 +1217,53 @@ if 'spark' in globals():
         display(result_df.filter('type == "segment"').limit(50))
     else:
         result_df.filter('type == "segment"').show(20, False)
+'''
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Transportation Splitter")
+    parser.add_argument("--input", type=str, required=True, help="Input path (e.g. S3 or local)")
+    parser.add_argument("--output", type=str, required=True, help="Output path prefix (e.g. S3 or local)")
+    parser.add_argument("--wkt_filter", type=str, default=None, help="WKT polygon to filter input (optional)")
+    parser.add_argument("--split-at-connectors", dest="split_at_connectors", action="store_true",
+                        help="Flag to split at connectors (default: True)")
+    parser.add_argument("--split-at-lr-columns", type=str, default=None,
+                        help="Comma-separated list of column names to include for LR splitting (optional)")
+    args = parser.parse_args()
+
+    spark = SparkSession.builder \
+        .appName("Transportation Splitter") \
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+        .config("spark.kryo.registrator", "org.apache.sedona.core.serde.SedonaKryoRegistrator") \
+        .getOrCreate()
+    sc = spark.sparkContext
+
+    # Sedona の初期化（これで空間関数が利用可能になります）
+    SedonaContext.create(spark)
+
+    # --split-at-lr-columns が指定されていれば、カンマ区切りでリスト化
+    lr_columns = args.split_at_lr_columns.split(",") if args.split_at_lr_columns else []
+    cfg = SplitConfig(split_at_connectors=args.split_at_connectors,
+                      lr_columns_to_include=lr_columns)
+
+    wrangler = SplitterDataWrangler(input_path=args.input, output_path_prefix=args.output)
+
+    result_df = split_transportation(spark, sc, wrangler, args.wkt_filter, cfg)
+
+    # もし "routes" カラムの本来の構造（ArrayType(StructType(...))）に再変換する必要があれば、以下のように from_json を適用する
+    routes_schema = ArrayType(
+        StructType([
+            StructField("name", StringType(), True),
+            StructField("network", StringType(), True),
+            StructField("ref", StringType(), True),
+            StructField("symbol", StringType(), True),
+            StructField("wikidata", StringType(), True),
+            StructField("between", ArrayType(DoubleType()), True)
+        ])
+    )
+
+    # "routes" カラムは文字列型なので、from_json で再構築します
+    result_df = result_df.withColumn("routes", from_json("routes", routes_schema))
+
+    result_df.show(20, False)
+
+    spark.stop()
+
