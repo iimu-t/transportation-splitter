@@ -7,8 +7,8 @@ import numpy as np
 np.object = object
 
 # 定数
-#S3_INPUT_PATH = "s3://overturemaps-data/splitter_output/exp_con.parquet"
-S3_INPUT_PATH = "s3://overturemaps-data/splitter_results_4_segments_splits/part-00000-7f1fd6b4-3750-4304-91de-b00019d71f34-c000.zstd.parquet"
+S3_INPUT_PATH = "s3://overturemaps-data/splitter_output/exp_con.parquet"
+#S3_INPUT_PATH = "s3://overturemaps-data/splitter_output/5ec99570ba4945ee81bf1ac4e3b48ad9.snappy.parquet"
 OUTPUT_GEOJSON = "./output.geojson"
 
 def main():
@@ -19,28 +19,19 @@ def main():
     # SparkSessionの作成
     spark = create_spark_session()
 
-    # S3からParquetファイルを読み込む（Spark経由）
-    try:
-        spark_df = spark.read.parquet(S3_INPUT_PATH)
-        if "geometry" in spark_df.columns:
-            spark_df = spark_df.drop("geometry")
-        pandas_df = spark_df.toPandas()
-    except Exception as e:
-        print("Spark read error, falling back to pyarrow:", e)
-        import pyarrow.parquet as pq
-        table = pq.read_table(S3_INPUT_PATH)
-        pandas_df = table.to_pandas()
-        spark_df = None
+    # S3からParquetファイルを読み込む
+    df = spark.read.parquet(S3_INPUT_PATH)
 
-    # カラム一覧・スキーマ出力（Spark読み込み成功時のみ）
-    if spark_df is not None:
-        print("=== Parquetファイルのカラム一覧 ===")
-        print(spark_df.columns)
-        print("=== Parquetファイルのスキーマ ===")
-        spark_df.printSchema()
-    else:
-        print("=== pyarrowで読み込んだデータのカラム一覧 ===")
-        print(pandas_df.columns)
+    # Parquetファイルのカラム一覧を出力
+    print("=== Parquetファイルのカラム一覧 ===")
+    print(df.columns)
+
+    # スキーマの詳細を出力
+    print("=== Parquetファイルのスキーマ ===")
+    df.printSchema()
+
+    # Spark DataFrameをPandas DataFrameに変換
+    pandas_df = df.toPandas()
 
     # geometry_wkt列からGeoDataFrameを作成（geometry_wkt列がWKT形式の文字列である前提）
     pandas_df['geometry'] = pandas_df['geometry_wkt'].apply(wkt.loads)
@@ -62,7 +53,6 @@ def create_spark_session(app_name: str = "Read S3 Parquet and Print Schema") -> 
         .config("fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
         .config("fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
         .getOrCreate()
-    sc = spark.sparkContext
     return spark
 
 

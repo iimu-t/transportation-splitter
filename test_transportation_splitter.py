@@ -26,7 +26,18 @@ from pyspark.sql.functions import from_json
 from pyspark.sql.types import ArrayType, StructType, StructField, StringType, DoubleType
 import argparse
 from sedona.spark import SedonaContext  # Sedonaの初期化に必要
+import re  # 既存のimportと合わせる
+from pyspark.sql.functions import udf
+from pyspark.sql.types import StringType
+# 追加: connectors文字列をJSON形式に変換するための関数とUDF定義
+def fix_connectors_json(s: str) -> str:
+    if s is None:
+        return None
+    s = re.sub(r'(\w+)=', r'"\1":', s)
+    s = re.sub(r'"connector_id":([A-Za-z0-9]+)', r'"connector_id":"\1"', s)
+    return s
 
+fix_connectors_udf = udf(fix_connectors_json, StringType())
 
 PROHIBITED_TRANSITIONS_COLUMN = "prohibited_transitions"
 DESTINATIONS_COLUMN = "destinations"
@@ -125,32 +136,59 @@ class SplitterDataWrangler:
     @staticmethod
     def is_geoparquet(spark, input_path, limit=1, geometry_column="geometry", merge_schema=False):
         try:
-            sample_data = spark.read.format("geoparquet").option("mergeSchema", str(merge_schema).lower()).load(input_path).limit(limit)
-            geometry_column_data_type = sample_data.schema[geometry_column].dataType
-            # GeoParquet uses GeometryType, and WKB uses BinaryType
-            return str(geometry_column_data_type) == "GeometryType()"
+            sample_data = spark.read.format("geoparquet") \
+                .option("mergeSchema", str(merge_schema).lower()) \
+                .load(input_path)
+            sample_data = sample_data.limit(limit)
+            sample_data.collect()  # Force evaluation to catch errors in driver.
         except Exception as e:
-            # read_geoparquet would throw an exception if it's not a geoparquet file.
-            # Assume it's parquet format here.
+            if "does not contain valid geo metadata" in str(e):
+                return False
             return False
+        if "geometry_wkt" in sample_data.columns:
+            return False
+        try:
+            geometry_column_data_type = sample_data.schema[geometry_column].dataType
+            # 追加: metadataにgeometry_typeが設定されていなければGeoParquetとみなさない
+            if not geometry_column_data_type.metadata.get("geometry_type"):
+                return False
+        except Exception as e:
+            return False
+        return str(geometry_column_data_type) == "GeometryType()"
 
-    # ---- 修正 ----
     @staticmethod
     def read_geoparquet(spark, path, merge_schema=True, geometry_column="geometry"):
-        # GeoParquetの判定を無視し、常に通常のParquetとして読み込む
-        return spark.read.option("mergeSchema", str(merge_schema).lower())\
-            .parquet(path)\
-            .withColumn(geometry_column, expr("ST_GeomFromWKT(geometry_wkt)"))
-    '''
-    @staticmethod
-    def read_geoparquet(spark, path, merge_schema=True, geometry_column="geometry"):
-        if SplitterDataWrangler.is_geoparquet(spark, path, geometry_column=geometry_column):
-            return spark.read.format("geoparquet").option("mergeSchema", str(merge_schema).lower()).load(path)
+        try:
+            if SplitterDataWrangler.is_geoparquet(spark, path, geometry_column=geometry_column):
+                try:
+                    return spark.read.format("geoparquet") \
+                        .option("mergeSchema", str(merge_schema).lower()) \
+                        .load(path)
+                except Exception as e_inner:
+                    print(f"GeoParquet read failed inside load, falling back to parquet read: {e_inner}")
+            else:
+                print("Not recognized as GeoParquet, falling back to parquet read.")
+        except Exception as e:
+            print(f"Error during is_geoparquet check: {e}")
+        print("Falling back to reading as parquet and reconstructing geometry column.")
+        df = spark.read.option("mergeSchema", str(merge_schema).lower()).parquet(path)
+        if geometry_column in df.columns:
+            dtype = df.schema[geometry_column].dataType
+            from pyspark.sql.types import BinaryType, StringType
+            if isinstance(dtype, StringType):
+                df = df.withColumn(geometry_column, expr("ST_GeomFromWKT(geometry)"))
+            elif isinstance(dtype, BinaryType):
+                df = df.withColumn(geometry_column, expr("ST_GeomFromWKB(geometry)"))
+            else:
+                try:
+                    df = df.withColumn(geometry_column, expr("ST_GeomFromWKT(geometry)"))
+                except Exception as e_wkt:
+                    df = df.withColumn(geometry_column, expr("ST_GeomFromWKB(geometry)"))
+        elif "geometry_wkt" in df.columns:
+            df = df.withColumn(geometry_column, expr("ST_GeomFromWKT(geometry_wkt)"))
         else:
-            return spark.read.option("mergeSchema", str(merge_schema).lower()).parquet(path) \
-                .withColumn(geometry_column, expr("ST_GeomFromWKB(geometry)"))
-    '''
-    # ---- 修正 ----
+            print("No geometry information found; returning dataframe as is.")
+        return df
 
     @staticmethod
     def write_geoparquet(df, path):
@@ -287,31 +325,36 @@ def filter_df(input_df, filter_wkt, condition_function = "ST_Intersects"):
     return input_df.filter(expr(filter_expression))
 
 def join_segments_with_connectors(input_df):
-    # ---- 修正 ----
-    connectors_schema = ArrayType(
-        StructType([
-            StructField("connector_id", StringType(), True),
-            StructField("at", DoubleType(), True)
-        ])
-    )
-
-    input_df = input_df.withColumn("connectors", from_json(col("connectors"), connectors_schema))
-    # ---- 修正 ----
     segments_df = input_df.filter(col("type") == "segment").withColumnRenamed("id", "segment_id")
-    '''
-    # ---- 修正 ----
-    # もし segments_df に "connectors" 列が存在して文字列型なら、
-    # 空の配列として再生成して型を合わせる
-    if "connectors" in segments_df.columns:
-        segments_df = segments_df.drop("connectors").withColumn(
-            "connectors", F.expr("array()").cast("array<struct<connector_id:string,at:double>>")
-        )
-    # ---- 修正 ----
-    '''
     connectors_df = input_df.filter(col("type") == "connector")\
         .withColumnRenamed("id", "connector_id")\
         .withColumnRenamed("geometry", "connector_geometry")
-
+    # 修正: connectors文字列を UDF で変換後、from_json を両ケースで利用
+    segments_df = segments_df.withColumn(
+        "connectors",
+        F.when(
+            F.col("connectors").rlike(r"^\[.*"),
+            from_json(
+                fix_connectors_udf(col("connectors")),
+                ArrayType(
+                    StructType([
+                        StructField("connector_id", StringType(), True),
+                        StructField("at", DoubleType(), True)
+                    ])
+                )
+            )
+        ).otherwise(
+            from_json(
+                fix_connectors_udf(F.concat(F.lit("["), col("connectors"), F.lit("]"))),
+                ArrayType(
+                    StructType([
+                        StructField("connector_id", StringType(), True),
+                        StructField("at", DoubleType(), True)
+                    ])
+                )
+            )
+        )
+    )
     segments_with_index = segments_df.withColumn(
         "connectors_with_index",
         F.expr("TRANSFORM(connectors, (c, i) -> STRUCT(c.connector_id AS id, c.at AS at, i AS index))")
@@ -905,9 +948,6 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
                 split_points = sorted(split_points, key=lambda p: p.lr)
                 split_points = [split_points[0], split_points[-1]]
 
-            # ---- 修正 ----
-            result_df.select("split_result.debug_messages").show(truncate=False)
-            # ---- 修正 ----
             debug_messages.append("adding lr split points...")
             lrs_set = set()
             for column in lr_columns_for_splitting:
@@ -933,15 +973,16 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
             #debug_messages.append("splitting into segments...")
             split_segments = split_line(input_segment.geometry, sorted_split_points)
             length_after_split = 0.0
-            for split_segment in split_segments:
-                split_length = get_length(split_segment.geometry)
+            for seg in split_segments:
+                if not are_different_coords(list(seg.geometry.coords)[0], list(seg.geometry.coords)[-1]):
+                    debug_messages.append(f"Skipping degenerate segment: {str(seg)}")
+                    continue
+                split_length = get_length(seg.geometry)
                 length_after_split += split_length
-                debug_messages.append(f"{split_segment.start_split_point.lr}-{split_segment.end_split_point.lr} ({split_length}m): " + str(split_segment))
-                if not are_different_coords(list(split_segment.geometry.coords)[0], list(split_segment.geometry.coords)[-1]):
-                    error_message += f"Wrong segment created: {split_segment.start_split_point.lr}-{split_segment.end_split_point.lr}: " + str(split_segment.geometry)
-                modified_segment_dict = get_split_segment_dict(original_segment_dict, input_segment.geometry, segment_length, split_segment, lr_columns_for_splitting, cfg.lr_split_point_min_dist_meters)
+                debug_messages.append(f"{seg.start_split_point.lr}-{seg.end_split_point.lr} ({split_length}m): " + str(seg))
+                modified_segment_dict = get_split_segment_dict(original_segment_dict, input_segment.geometry, segment_length, seg, lr_columns_for_splitting, cfg.lr_split_point_min_dist_meters)
                 split_segments_rows.append(Row(**modified_segment_dict))
-
+            
             for split_point in split_points:
                 if not split_point.is_lr_added:
                     continue
@@ -951,10 +992,7 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
                     "type": "connector",
                     "geometry": split_point.geometry
                 })
-                # 修正：'connectors' 列の型を合わせるため、明示的に None をセットする
-                new_connector_dict["connectors"] = None
                 added_connectors_rows.append(Row(**new_connector_dict))
-
             is_success = True
             exception_traceback = []
             if error_message:
@@ -984,43 +1022,8 @@ def resolve_tr_references(result_df):
     referenced_splits_info_df = referenced_segment_ids_df.join(
         result_df,
         result_df.id == referenced_segment_ids_df.referenced_segment_id,
-        "inner"
-    ).select(
-        col("id").alias("ref_id"),
-        col("start_lr").alias("ref_start_lr"),
-        col("end_lr").alias("ref_end_lr"),
-        col("connectors").alias("ref_connectors")
-    )
+        "inner").select(col("id").alias("ref_id"), col("start_lr").alias("ref_start_lr"), col("end_lr").alias("ref_end_lr"), col("connectors").alias("ref_connectors"))
 
-    # ---- 修正 ----
-    ref_joined_df = splits_w_trs_df.alias("trs").join(
-        referenced_splits_info_df.alias("ref"),
-        F.col("trs.segment_id") == F.col("ref.ref_id"),
-        "inner"
-    ).select(
-        # ↓ ここで “id” を拾っておかないと後で参照できない
-        F.col("trs.id").alias("id"),
-
-        # ここで必要になるカラムをすべて alias しておく
-        F.col("trs.segment_id").alias("segment_id"),
-        F.col("trs.start_lr").alias("start_lr"),
-        F.col("trs.end_lr").alias("end_lr"),
-
-        # turn_restrictions の展開で出てくる中間情報
-        F.col("trs.connector_id"),
-        F.col("trs.next_connector_id"),
-        F.col("trs.final_heading"),
-        F.col("trs.tr_index"),
-        F.col("trs.sequence_index"),
-
-        # 参照先のスプリット情報
-        F.col("ref.ref_id"),
-        F.col("ref.ref_start_lr"),
-        F.col("ref.ref_end_lr"),
-        F.col("ref.ref_connectors")
-    )
-
-    '''
     ref_joined_df = splits_w_trs_df.join(
         referenced_splits_info_df,
         splits_w_trs_df.segment_id == referenced_splits_info_df.ref_id,
@@ -1029,8 +1032,6 @@ def resolve_tr_references(result_df):
         splits_w_trs_df["*"],
         referenced_splits_info_df["*"]
     ).drop("segment_id")
-    '''
-    # ---- 修正 ----
 
     # if next_connector_id is null then it's the last reference in the sequence - in this case final_heading is used - if forward then the referenced connector id is expected to be the first, if backward then second
     # if it's not the last in the sequence, then we need the segment to have references to both the connector in the TR for the current sequence index as well as the next sequence index - so the two connectors must be connector_id and next_connector_id, order not relevant (they could be swapped).
@@ -1075,129 +1076,10 @@ def resolve_tr_references(result_df):
     
     apply_tr_split_refs_udf = udf(apply_tr_split_refs, resolved_prohibited_transitions_schema)
 
-    result_trs_resolved_df = result_w_trs_refs_df\
+    result_w_trs_refs_df = result_w_trs_refs_df\
         .withColumn(PROHIBITED_TRANSITIONS_COLUMN, apply_tr_split_refs_udf(col(PROHIBITED_TRANSITIONS_COLUMN), col("turn_restrictions")))
-    return result_trs_resolved_df
+    return result_w_trs_refs_df
 
-def resolve_destinations_references(result_df):
-    # destinations を含むスプリット行だけ取り出して explode
-    splits_w_destinations_df = (
-        result_df
-        .filter(f"{DESTINATIONS_COLUMN} is not null and size({DESTINATIONS_COLUMN})>0")
-        .select("id", "start_lr", "end_lr", DESTINATIONS_COLUMN)
-        .withColumn("dr", F.explode(DESTINATIONS_COLUMN))
-        .select("*", "dr.*")
-        .drop("dr")
-    )
-
-    # 参照先の segment_id 一覧を取り出す
-    referenced_segment_ids_df = (
-        splits_w_destinations_df
-        .select(F.col("to_segment_id").alias("referenced_segment_id"))
-        .distinct()
-    )
-
-    # 参照先スプリット情報を取り出し、カラム名が被らないようリネーム
-    referenced_splits_info_df = (
-        referenced_segment_ids_df
-        .join(result_df, result_df.id == referenced_segment_ids_df.referenced_segment_id, "inner")
-        .select(
-            F.col("id").alias("ref_id"),
-            F.col("start_lr").alias("ref_start_lr"),       # リネーム
-            F.col("end_lr").alias("ref_end_lr"),           # リネーム
-            F.col("connectors").alias("ref_connectors")    # リネーム
-        )
-    )
-
-    # 元テーブル (splits_w_destinations_df) と参照先テーブル (referenced_splits_info_df) を join
-    # カラム衝突を回避するため、.alias() で両テーブルに別名を振り、select() で明示的に取得するカラムを指定
-    ref_joined_df = (
-        splits_w_destinations_df.alias("dest")
-        .join(
-            referenced_splits_info_df.alias("ref"),
-            F.col("dest.to_segment_id") == F.col("ref.ref_id"),
-            "inner"
-        )
-        .select(
-            # destination 側のカラム
-            F.col("dest.id").alias("id"),
-            F.col("dest.start_lr").alias("start_lr"),
-            F.col("dest.end_lr").alias("end_lr"),
-            F.col("dest.labels"),
-            F.col("dest.symbols"),
-            F.col("dest.from_connector_id"),
-            F.col("dest.to_segment_id"),
-            F.col("dest.to_connector_id"),
-            F.col("dest.when"),
-            F.col("dest.final_heading"),
-
-            # 参照先スプリット情報 (衝突しないよう prefix を付けたカラム名を使う)
-            F.col("ref.ref_id"),
-            F.col("ref.ref_start_lr"),
-            F.col("ref.ref_end_lr"),
-            F.col("ref.ref_connectors")
-        )
-    )
-
-    # forward/backward ごとに filter する条件式
-    referenced_split_condition = F.when(
-        F.col("final_heading") == "forward",
-        F.expr("ref_connectors[0].connector_id = to_connector_id")
-    ).otherwise(
-        F.expr("ref_connectors[1].connector_id = to_connector_id")
-    )
-
-    # filter 後に必要な項目だけ struct 化
-    destination_refs_resolved_df = (
-        ref_joined_df
-        .filter(referenced_split_condition)
-        .select(
-            F.col("id").alias("from_id"),
-            F.col("start_lr").alias("from_start_lr"),
-            F.col("end_lr").alias("from_end_lr"),
-            F.struct(
-                "labels",
-                "symbols",
-                "from_connector_id",
-                "to_segment_id",
-                # ↓ 先に LR を入れる
-                F.col("ref_start_lr").alias("to_segment_start_lr"),
-                F.col("ref_end_lr").alias("to_segment_end_lr"),
-                # そのあと connector_id
-                "to_connector_id",
-                "when",
-                "final_heading"
-            ).alias("d")
-        )
-    )
-
-    # groupBy してまとめる
-    destination_refs_resolved_agg_df = (
-        destination_refs_resolved_df
-        .groupBy("from_id", "from_start_lr", "from_end_lr")
-        .agg(F.collect_list("d").alias(f"{DESTINATIONS_COLUMN}_resolved"))
-    )
-
-    # 元のデータに left join で紐づけ、カラム名を戻す
-    result_w_destinations_resolved_df = (
-        result_df.drop(DESTINATIONS_COLUMN)
-        .join(
-            destination_refs_resolved_agg_df,
-            (
-                (result_df.id == destination_refs_resolved_agg_df.from_id) &
-                (result_df.start_lr == destination_refs_resolved_agg_df.from_start_lr) &
-                (result_df.end_lr == destination_refs_resolved_agg_df.from_end_lr)
-            ),
-            "left"
-        )
-        .drop("from_id", "from_start_lr", "from_end_lr")
-        .withColumnRenamed(f"{DESTINATIONS_COLUMN}_resolved", DESTINATIONS_COLUMN)
-    )
-
-    return result_w_destinations_resolved_df
-
-# ---- 修正 ----
-'''
 def resolve_destinations_references(result_df):
     splits_w_destinations_df = result_df.filter(f"{DESTINATIONS_COLUMN} is not null and size({DESTINATIONS_COLUMN})>0").select("id", "start_lr", "end_lr", DESTINATIONS_COLUMN).withColumn("dr", F.explode(DESTINATIONS_COLUMN)).select("*", "dr.*").drop("dr")
 
@@ -1235,8 +1117,6 @@ def resolve_destinations_references(result_df):
         "left").drop("from_id", "from_start_lr", "from_end_lr").withColumnRenamed(f"{DESTINATIONS_COLUMN}_resolved", DESTINATIONS_COLUMN)
     
     return result_w_destinations_resolved_df
-'''
-# ---- 修正 ----
 
 def get_aggregated_metrics(result_df):
     segments_df = result_df.filter("type='segment'")
@@ -1259,9 +1139,6 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
 
     if filter_wkt is None:
         filtered_df = wrangler.read(spark, SplitterStep.read_input)
-        # ---- 修正----
-        filtered_df = filtered_df.withColumn(DESTINATIONS_COLUMN, from_json(col(DESTINATIONS_COLUMN), resolved_destinations_schema))
-        # ---- 修正----
     else:
         # Step 1 Filter only features that intersect with given polygon wkt
         if not wrangler.check_exists(spark, SplitterStep.spatial_filter) or not cfg.reuse_existing_intermediate_outputs:
@@ -1294,14 +1171,9 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
         print(f"split_joined_segments()...")
         split_segments_df = split_joined_segments(sc, joined_df, lr_columns_for_splitting, cfg)
         wrangler.write(split_segments_df, SplitterStep.raw_split)
-    # ---- 修正----
     else:
         split_segments_df = wrangler.read(spark, SplitterStep.raw_split)
-    '''
-    else:
-        split_segments_df = wrangler.write(spark, SplitterStep.raw_split)
-    '''
-    # ---- 修正----
+
     print(f"split_segments_df.count() = {str(split_segments_df.count())}")
 
     # Step 4 Format output (flatten result, explode rows, pick columns, unions)
@@ -1335,26 +1207,8 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
     final_segments_df.groupBy("is_success", coalesce(element_at(split(final_segments_df["error_message"], ":"), 1), "error_message")).agg(count("*").alias("count")).show(20, False)
     final_segments_df.groupBy("id").agg(count("*").alias("number_of_splits")).groupBy("number_of_splits").agg(count("*")).orderBy("number_of_splits").show()
 
-    # ---- 修正----
-    #all_connectors_df = filtered_df.filter("type == 'connector'").unionByName(added_connectors_df).select(filtered_df.columns)
-    # 空の配列リテラルを生成し、array<struct<connector_id:string,at:double>> 型にキャスト
-    empty_connector_array = F.expr("array()").cast("array<struct<connector_id:string,at:double>>")
-
-    # セグメント行は既に正しい connectors の値を持つので変更せず、
-    # connector 行だけ空の配列（または必要な値）を設定する例
-    all_connectors_df = (
-        filtered_df.filter("type == 'connector'")
-            .select([
-                # connector 行の場合は connectors 列は空の配列に設定
-                F.lit(None).cast("array<struct<connector_id:string,at:double>>").alias("connectors")
-                if c == "connectors" else col(c)
-                for c in filtered_df.columns
-            ])
-        .unionByName(
-            added_connectors_df.select(filtered_df.columns), allowMissingColumns=True
-        )
-    )
-    # ---- 修正----
+    added_connectors_df = added_connectors_df.withColumn("connectors", F.to_json("connectors"))
+    all_connectors_df = filtered_df.filter("type == 'connector'").unionByName(added_connectors_df).select(filtered_df.columns)
     if PROHIBITED_TRANSITIONS_COLUMN in final_segments_df.columns:
         final_segments_df = resolve_tr_references(final_segments_df)
 
@@ -1369,49 +1223,15 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
     for extra_col in extra_columns:
         all_connectors_df = all_connectors_df.withColumn(extra_col, lit(None))
 
-
-    # ---- 修正 ----
-    # final_segments_df のスキーマに合わせる
-    final_df = final_segments_df.select(final_segments_df.columns).unionByName(all_connectors_df.select(final_segments_df.columns), allowMissingColumns=True)
-    #final_df = final_segments_df.select(filtered_df.columns + extra_columns).unionByName(all_connectors_df)
-    # ---- 修正 ----
+    final_df = final_segments_df.select(filtered_df.columns + extra_columns).unionByName(all_connectors_df)
     wrangler.write(final_df, SplitterStep.final_output)
     loaded_final_df = wrangler.read(spark, SplitterStep.final_output)
     loaded_final_df.groupBy("type").agg(count("*").alias("count")).show()
-
     print("split segments metrics:")
     get_aggregated_metrics(loaded_final_df).show()
-        
-    return loaded_final_df
+    return loaded_final_df        
 
-'''
 # COMMAND ----------
-if 'spark' in globals():
-    overture_release_version = "2024-11-13.0"
-    overture_release_path = "wasbs://release@overturemapswestus2.blob.core.windows.net" #  "s3://overturemaps-us-west-2/release"
-    base_output_path = "wasbs://test@ovtpipelinedev.blob.core.windows.net/transportation-splits" # "s3://<bucket>/transportation-split"
-
-    wkt_filter = None
-
-    # South America polygon
-    #wkt_filter = "POLYGON ((-180 -90, 180 -90, 180 -59, -25.8 -59, -25.8 28.459033, -79.20293 28.05483, -79.947494 24.627045, -86.352539 22.796439, -81.650495 15.845105, -82.60631 10.260871, -84.51781 8.331083, -107.538877 10.879395, -120 -59, -180 -59, -180 -90))"
-
-    # Tiny test polygon in Bellevue WA
-    wkt_filter = "POLYGON ((-122.1896338 47.6185118, -122.1895695 47.6124029, -122.1792197 47.6129526, -122.1793771 47.6178368, -122.1896338 47.6185118))"
-
-    input_path = f"{overture_release_path}/{overture_release_version}/theme=transportation"
-    filter_target = "global" if not wkt_filter else "filtered"
-    output_path_prefix = f"{base_output_path}/{overture_release_version}/{filter_target}"
-
-    wrangler = SplitterDataWrangler(input_path=input_path, output_path_prefix=output_path_prefix)
-
-    result_df = split_transportation(spark, sc, wrangler, wkt_filter)
-    if "DATABRICKS_RUNTIME_VERSION" in os.environ:
-        display(result_df.filter('type == "segment"').limit(50))
-    else:
-        result_df.filter('type == "segment"').show(20, False)
-'''
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Transportation Splitter")
     parser.add_argument("--input", type=str, required=True, help="Input path (e.g. S3 or local)")
@@ -1429,7 +1249,7 @@ if __name__ == "__main__":
         .config("spark.kryo.registrator", "org.apache.sedona.core.serde.SedonaKryoRegistrator") \
         .getOrCreate()
     sc = spark.sparkContext
-
+    
     # Sedona の初期化（これで空間関数が利用可能になります）
     SedonaContext.create(spark)
 
@@ -1439,7 +1259,6 @@ if __name__ == "__main__":
                       lr_columns_to_include=lr_columns)
 
     wrangler = SplitterDataWrangler(input_path=args.input, output_path_prefix=args.output)
-
     result_df = split_transportation(spark, sc, wrangler, args.wkt_filter, cfg)
 
     # もし "routes" カラムの本来の構造（ArrayType(StructType(...))）に再変換する必要があれば、以下のように from_json を適用する
@@ -1456,7 +1275,6 @@ if __name__ == "__main__":
 
     # "routes" カラムは文字列型なので、from_json で再構築します
     result_df = result_df.withColumn("routes", from_json("routes", routes_schema))
-
     result_df.show(20, False)
 
     spark.stop()
