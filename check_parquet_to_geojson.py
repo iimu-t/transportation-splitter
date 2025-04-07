@@ -4,7 +4,6 @@ from pyspark.sql import SparkSession
 import geopandas as gpd
 from shapely import wkt
 import numpy as np
-np.object = object
 
 # 定数
 #S3_INPUT_PATH = "s3://overturemaps-data/splitter_output/exp_con.parquet"
