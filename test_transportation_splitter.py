@@ -538,17 +538,17 @@ def apply_lr_scope(
     else:
         return x
 
-def get_trs(turn_restrictions, connectors: list[dict]):
+def get_trs(prohibited_transitions, connectors):
     # extract TR references structure;
     # this will be used after split is complete to identify for each segment_id reference which of the splits of the original segment_id to use;
     # this step includes pruning out the TRs that don't apply for this split - we check that the TR's first connector id appears in the correct index in connectors corresponding to the TR's heading scope (for forward: index=1, for backward: index=0)
+    turn_restrictions = prohibited_transitions
     if turn_restrictions is None:
         return None, None
 
     flattened_tr_seq_items = []
     trs_to_keep: list[dict] = []
     for tr in turn_restrictions:
-        tr_heading = (tr.get("when") or {}).get("heading")
         tr_sequence = tr.get("sequence")
         if not tr_sequence or len(tr_sequence) == 0:
             continue
@@ -596,6 +596,8 @@ def get_destinations(destinations, connectors: list[dict]):
     return destinations_to_keep if destinations_to_keep else None
 
 def destination_applies_to_split_connectors(d, connectors: list[dict]):
+    if not isinstance(d, dict):
+        return False
     if not connectors or len(connectors) != 2:
         # at this point modified segments are expected to have exactly two connector ids, skip edge cases that don't
         return False
