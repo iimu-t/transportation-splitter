@@ -5,7 +5,6 @@
 # MAGIC # AWS Glue notebook - see instructions for magic commands
 
 # COMMAND ----------
-
 from collections import deque
 from copy import deepcopy
 from enum import Enum
@@ -25,10 +24,11 @@ from pyspark.sql.functions import when, array
 from pyspark.sql.functions import from_json
 from pyspark.sql.types import ArrayType, StructType, StructField, StringType, DoubleType
 import argparse
-from sedona.spark import SedonaContext  # Sedonaの初期化に必要
-import re  # 既存のimportと合わせる
+from sedona.spark import SedonaContext
+import re
 from pyspark.sql.functions import udf
 from pyspark.sql.types import StringType
+
 # 追加: connectors文字列をJSON形式に変換するための関数とUDF定義
 def fix_connectors_json(s: str) -> str:
     if s is None:
@@ -38,6 +38,23 @@ def fix_connectors_json(s: str) -> str:
     return s
 
 fix_connectors_udf = udf(fix_connectors_json, StringType())
+
+# 追加: prohibited_transitions文字列をJSON形式に変換するための関数とUDF定義
+def parse_prohibited_transitions(s: str) -> str:
+    """
+    入力例:
+    "[{sequence=[{connector_id=08f2f5a32c102b9b047fff3dbc5ab82a, segment_id=08b2f5a32c102fff047f9f3d84f598e1}], final_heading=backward, when={heading=forward, during=null, using=null, recognized=null, mode=null, vehicle=null}, between=null}]"
+    この文字列を有効なJSON文字列に変換します。
+    """
+    if s is None:
+        return None
+    # キー部分を"[{", ","や"{"の直後にある単語にクオートを付与
+    s = re.sub(r'([{,]\s*)(\w+)=', r'\1"\2":', s)
+    # 値部分（アルファベット始まりの単語）がクオートされていない場合、クオートを付与（ヒューリスティック）
+    s = re.sub(r'(":)([a-zA-Z_][a-zA-Z0-9_-]*)([,\}])', r'\1"\2"\3', s)
+    return s
+
+parse_prohibited_transitions_udf = udf(parse_prohibited_transitions, StringType())
 
 PROHIBITED_TRANSITIONS_COLUMN = "prohibited_transitions"
 DESTINATIONS_COLUMN = "destinations"

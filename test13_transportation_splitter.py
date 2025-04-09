@@ -24,10 +24,37 @@ from pyspark.sql.functions import when, array
 from pyspark.sql.functions import from_json
 from pyspark.sql.types import ArrayType, StructType, StructField, StringType, DoubleType
 import argparse
-from sedona.spark import SedonaContext  # Sedonaの初期化に必要
-import re  # 既存のimportと合わせる
+from sedona.spark import SedonaContext
+import re
 from pyspark.sql.functions import udf
 from pyspark.sql.types import StringType
+
+# 追加: connectors文字列をJSON形式に変換するための関数とUDF定義
+def fix_connectors_json(s: str) -> str:
+    if s is None:
+        return None
+    s = re.sub(r'(\w+)=', r'"\1":', s)
+    s = re.sub(r'"connector_id":([A-Za-z0-9]+)', r'"connector_id":"\1"', s)
+    return s
+
+fix_connectors_udf = udf(fix_connectors_json, StringType())
+
+# 追加: prohibited_transitions文字列をJSON形式に変換するための関数とUDF定義
+def parse_prohibited_transitions(s: str) -> str:
+    """
+    入力例:
+    "[{sequence=[{connector_id=08f2f5a32c102b9b047fff3dbc5ab82a, segment_id=08b2f5a32c102fff047f9f3d84f598e1}], final_heading=backward, when={heading=forward, during=null, using=null, recognized=null, mode=null, vehicle=null}, between=null}]"
+    この文字列を有効なJSON文字列に変換します。
+    """
+    if s is None:
+        return None
+    # キー部分を"[{", ","や"{"の直後にある単語にクオートを付与
+    s = re.sub(r'([{,]\s*)(\w+)=', r'\1"\2":', s)
+    # 値部分（アルファベット始まりの単語）がクオートされていない場合、クオートを付与（ヒューリスティック）
+    s = re.sub(r'(":)([a-zA-Z_][a-zA-Z0-9_-]*)([,\}])', r'\1"\2"\3', s)
+    return s
+
+parse_prohibited_transitions_udf = udf(parse_prohibited_transitions, StringType())
 
 PROHIBITED_TRANSITIONS_COLUMN = "prohibited_transitions"
 DESTINATIONS_COLUMN = "destinations"
@@ -126,22 +153,59 @@ class SplitterDataWrangler:
     @staticmethod
     def is_geoparquet(spark, input_path, limit=1, geometry_column="geometry", merge_schema=False):
         try:
-            sample_data = spark.read.format("geoparquet").option("mergeSchema", str(merge_schema).lower()).load(input_path).limit(limit)
-            geometry_column_data_type = sample_data.schema[geometry_column].dataType
-            # GeoParquet uses GeometryType, and WKB uses BinaryType
-            return str(geometry_column_data_type) == "GeometryType()"
+            sample_data = spark.read.format("geoparquet") \
+                .option("mergeSchema", str(merge_schema).lower()) \
+                .load(input_path)
+            sample_data = sample_data.limit(limit)
+            sample_data.collect()  # Force evaluation to catch errors in driver.
         except Exception as e:
-            # read_geoparquet would throw an exception if it's not a geoparquet file.
-            # Assume it's parquet format here.
+            if "does not contain valid geo metadata" in str(e):
+                return False
             return False
+        if "geometry_wkt" in sample_data.columns:
+            return False
+        try:
+            geometry_column_data_type = sample_data.schema[geometry_column].dataType
+            # 追加: metadataにgeometry_typeが設定されていなければGeoParquetとみなさない
+            if not geometry_column_data_type.metadata.get("geometry_type"):
+                return False
+        except Exception as e:
+            return False
+        return str(geometry_column_data_type) == "GeometryType()"
 
     @staticmethod
     def read_geoparquet(spark, path, merge_schema=True, geometry_column="geometry"):
-        if SplitterDataWrangler.is_geoparquet(spark, path, geometry_column=geometry_column):
-            return spark.read.format("geoparquet").option("mergeSchema", str(merge_schema).lower()).load(path)
+        try:
+            if SplitterDataWrangler.is_geoparquet(spark, path, geometry_column=geometry_column):
+                try:
+                    return spark.read.format("geoparquet") \
+                        .option("mergeSchema", str(merge_schema).lower()) \
+                        .load(path)
+                except Exception as e_inner:
+                    print(f"GeoParquet read failed inside load, falling back to parquet read: {e_inner}")
+            else:
+                print("Not recognized as GeoParquet, falling back to parquet read.")
+        except Exception as e:
+            print(f"Error during is_geoparquet check: {e}")
+        print("Falling back to reading as parquet and reconstructing geometry column.")
+        df = spark.read.option("mergeSchema", str(merge_schema).lower()).parquet(path)
+        if geometry_column in df.columns:
+            dtype = df.schema[geometry_column].dataType
+            from pyspark.sql.types import BinaryType, StringType
+            if isinstance(dtype, StringType):
+                df = df.withColumn(geometry_column, expr("ST_GeomFromWKT(geometry)"))
+            elif isinstance(dtype, BinaryType):
+                df = df.withColumn(geometry_column, expr("ST_GeomFromWKB(geometry)"))
+            else:
+                try:
+                    df = df.withColumn(geometry_column, expr("ST_GeomFromWKT(geometry)"))
+                except Exception as e_wkt:
+                    df = df.withColumn(geometry_column, expr("ST_GeomFromWKB(geometry)"))
+        elif "geometry_wkt" in df.columns:
+            df = df.withColumn(geometry_column, expr("ST_GeomFromWKT(geometry_wkt)"))
         else:
-            return spark.read.option("mergeSchema", str(merge_schema).lower()).parquet(path) \
-                .withColumn(geometry_column, expr("ST_GeomFromWKB(geometry)"))
+            print("No geometry information found; returning dataframe as is.")
+        return df
 
     @staticmethod
     def write_geoparquet(df, path):
@@ -281,8 +345,33 @@ def join_segments_with_connectors(input_df):
     segments_df = input_df.filter(col("type") == "segment").withColumnRenamed("id", "segment_id")
     connectors_df = input_df.filter(col("type") == "connector")\
         .withColumnRenamed("id", "connector_id")\
-        .withColumnRenamed("geometry", "connector_geometry")\
-
+        .withColumnRenamed("geometry", "connector_geometry")
+    # 修正: connectors文字列を UDF で変換後、from_json を両ケースで利用
+    segments_df = segments_df.withColumn(
+        "connectors",
+        F.when(
+            F.col("connectors").rlike(r"^\[.*"),
+            from_json(
+                fix_connectors_udf(col("connectors")),
+                ArrayType(
+                    StructType([
+                        StructField("connector_id", StringType(), True),
+                        StructField("at", DoubleType(), True)
+                    ])
+                )
+            )
+        ).otherwise(
+            from_json(
+                fix_connectors_udf(F.concat(F.lit("["), col("connectors"), F.lit("]"))),
+                ArrayType(
+                    StructType([
+                        StructField("connector_id", StringType(), True),
+                        StructField("at", DoubleType(), True)
+                    ])
+                )
+            )
+        )
+    )
     segments_with_index = segments_df.withColumn(
         "connectors_with_index",
         F.expr("TRANSFORM(connectors, (c, i) -> STRUCT(c.connector_id AS id, c.at AS at, i AS index))")
@@ -466,17 +555,17 @@ def apply_lr_scope(
     else:
         return x
 
-def get_trs(turn_restrictions, connectors: list[dict]):
+def get_trs(prohibited_transitions, connectors):
     # extract TR references structure;
     # this will be used after split is complete to identify for each segment_id reference which of the splits of the original segment_id to use;
     # this step includes pruning out the TRs that don't apply for this split - we check that the TR's first connector id appears in the correct index in connectors corresponding to the TR's heading scope (for forward: index=1, for backward: index=0)
+    turn_restrictions = prohibited_transitions
     if turn_restrictions is None:
         return None, None
 
     flattened_tr_seq_items = []
     trs_to_keep: list[dict] = []
     for tr in turn_restrictions:
-        tr_heading = (tr.get("when") or {}).get("heading")
         tr_sequence = tr.get("sequence")
         if not tr_sequence or len(tr_sequence) == 0:
             continue
@@ -524,6 +613,8 @@ def get_destinations(destinations, connectors: list[dict]):
     return destinations_to_keep if destinations_to_keep else None
 
 def destination_applies_to_split_connectors(d, connectors: list[dict]):
+    if not isinstance(d, dict):
+        return False
     if not connectors or len(connectors) != 2:
         # at this point modified segments are expected to have exactly two connector ids, skip edge cases that don't
         return False
@@ -901,13 +992,14 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
             #debug_messages.append("splitting into segments...")
             split_segments = split_line(input_segment.geometry, sorted_split_points)
             length_after_split = 0.0
-            for split_segment in split_segments:
-                split_length = get_length(split_segment.geometry)
+            for seg in split_segments:
+                if not are_different_coords(list(seg.geometry.coords)[0], list(seg.geometry.coords)[-1]):
+                    debug_messages.append(f"Skipping degenerate segment: {str(seg)}")
+                    continue
+                split_length = get_length(seg.geometry)
                 length_after_split += split_length
-                debug_messages.append(f"{split_segment.start_split_point.lr}-{split_segment.end_split_point.lr} ({split_length}m): " + str(split_segment))
-                if not are_different_coords(list(split_segment.geometry.coords)[0], list(split_segment.geometry.coords)[-1]):
-                    error_message += f"Wrong segment created: {split_segment.start_split_point.lr}-{split_segment.end_split_point.lr}: " + str(split_segment.geometry)
-                modified_segment_dict = get_split_segment_dict(original_segment_dict, input_segment.geometry, segment_length, split_segment, lr_columns_for_splitting, cfg.lr_split_point_min_dist_meters)
+                debug_messages.append(f"{seg.start_split_point.lr}-{seg.end_split_point.lr} ({split_length}m): " + str(seg))
+                modified_segment_dict = get_split_segment_dict(original_segment_dict, input_segment.geometry, segment_length, seg, lr_columns_for_splitting, cfg.lr_split_point_min_dist_meters)
                 split_segments_rows.append(Row(**modified_segment_dict))
             
             for split_point in split_points:
@@ -1053,77 +1145,6 @@ def get_aggregated_metrics(result_df):
     metrics_df = metrics_df.withColumn("percentage", _round((col("value_count") / total_row_count) * 100, 2))
     return metrics_df.orderBy('key', 'value')
 
-# 追加: 拡充された segment の properties 用スキーマ
-segment_properties_schema = StructType([
-    StructField("theme", StringType(), True),
-    StructField("type", StringType(), True),
-    StructField("version", IntegerType(), True),
-    StructField("subtype", StringType(), True),
-    StructField("class", StringType(), True),
-    StructField("connectors", ArrayType(StructType([
-         StructField("connector_id", StringType(), True),
-         StructField("at", DoubleType(), True)
-    ])), True),
-    StructField("names", StructType([
-         StructField("primary", StringType(), True)
-    ]), True),
-    # 追加: access_restrictionsフィールド
-    StructField("access_restrictions", ArrayType(StructType([
-         StructField("access_type", StringType(), True),
-         StructField("when", StructType([
-             StructField("mode", ArrayType(StringType()), True)
-         ]), True)
-    ])), True),
-    StructField("prohibited_transitions", ArrayType(StructType([
-         StructField("sequence", ArrayType(StructType([
-              StructField("segment_id", StringType(), True),
-              StructField("connector_id", StringType(), True)
-         ])), True),
-         StructField("final_heading", StringType(), True),
-         StructField("when", StructType([
-              StructField("heading", StringType(), True),
-              StructField("during", StringType(), True)
-         ]), True)
-    ])), True),
-    StructField("road_surface", ArrayType(StructType([
-          StructField("value", StringType(), True)
-    ])), True)
-])
-    
-# 既存の segment_schema を拡充
-segment_schema = StructType([
-    StructField("id", StringType(), True),
-    StructField("geometry", StringType(), True),
-    StructField("properties", segment_properties_schema),
-    StructField("routes", ArrayType(StructType([
-        StructField("name", StringType(), True),
-        StructField("network", StringType(), True),
-        StructField("ref", StringType(), True),
-        StructField("symbol", StringType(), True),
-        StructField("wikidata", StringType(), True),
-        StructField("between", ArrayType(DoubleType()), True)
-    ])), True)
-])
-
-# 追加: Connector 用の properties 用スキーマの拡充
-connector_properties_schema = StructType([
-    StructField("theme", StringType(), True),
-    StructField("type", StringType(), True),
-    StructField("version", IntegerType(), True)
-    # 必要に応じて他のフィールドを追加してください
-])
-
-# 変更: Parquet 読み込み後に "properties" カラムを type に応じて JSON 変換する関数の更新
-def convert_properties_to_json(df):
-    return df.withColumn(
-        "properties",
-        F.when(col("type") == "connector",
-               from_json(col("properties"), connector_properties_schema)
-        ).otherwise(
-               from_json(col("properties"), segment_schema["properties"])
-        )
-    )
-
 def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=None, cfg: SplitConfig = DEFAULT_CFG):
     print(f"filter_wkt: {filter_wkt}")
     print(f"write config: {wrangler}")
@@ -1150,10 +1171,6 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
 
     print(f"filtered_df.count() = {str(filtered_df.count())}")
 
-    # 追加: Parquet 内の対象カラムを JSON 変換
-    if "properties" in filtered_df.columns:
-        filtered_df = convert_properties_to_json(filtered_df)
-
     lr_columns_for_splitting = get_filtered_columns(get_columns_with_struct_field_name(filtered_df, LR_SCOPE_KEY), cfg.lr_columns_to_include, cfg.lr_columns_to_exclude)
     print("lr_columns_for_splitting: ")
     print(lr_columns_for_splitting)
@@ -1174,7 +1191,7 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
         split_segments_df = split_joined_segments(sc, joined_df, lr_columns_for_splitting, cfg)
         wrangler.write(split_segments_df, SplitterStep.raw_split)
     else:
-        split_segments_df = wrangler.write(spark, SplitterStep.raw_split)
+        split_segments_df = wrangler.read(spark, SplitterStep.raw_split)
 
     print(f"split_segments_df.count() = {str(split_segments_df.count())}")
 
@@ -1209,6 +1226,7 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
     final_segments_df.groupBy("is_success", coalesce(element_at(split(final_segments_df["error_message"], ":"), 1), "error_message")).agg(count("*").alias("count")).show(20, False)
     final_segments_df.groupBy("id").agg(count("*").alias("number_of_splits")).groupBy("number_of_splits").agg(count("*")).orderBy("number_of_splits").show()
 
+    added_connectors_df = added_connectors_df.withColumn("connectors", F.to_json("connectors"))
     all_connectors_df = filtered_df.filter("type == 'connector'").unionByName(added_connectors_df).select(filtered_df.columns)
     if PROHIBITED_TRANSITIONS_COLUMN in final_segments_df.columns:
         final_segments_df = resolve_tr_references(final_segments_df)
@@ -1228,11 +1246,9 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
     wrangler.write(final_df, SplitterStep.final_output)
     loaded_final_df = wrangler.read(spark, SplitterStep.final_output)
     loaded_final_df.groupBy("type").agg(count("*").alias("count")).show()
-
     print("split segments metrics:")
     get_aggregated_metrics(loaded_final_df).show()
-        
-    return loaded_final_df
+    return loaded_final_df        
 
 # COMMAND ----------
 if __name__ == "__main__":
@@ -1263,5 +1279,21 @@ if __name__ == "__main__":
 
     wrangler = SplitterDataWrangler(input_path=args.input, output_path_prefix=args.output)
     result_df = split_transportation(spark, sc, wrangler, args.wkt_filter, cfg)
+
+    # もし "routes" カラムの本来の構造（ArrayType(StructType(...))）に再変換する必要があれば、以下のように from_json を適用する
+    routes_schema = ArrayType(
+        StructType([
+            StructField("name", StringType(), True),
+            StructField("network", StringType(), True),
+            StructField("ref", StringType(), True),
+            StructField("symbol", StringType(), True),
+            StructField("wikidata", StringType(), True),
+            StructField("between", ArrayType(DoubleType()), True)
+        ])
+    )
+
+    # "routes" カラムは文字列型なので、from_json で再構築します
+    result_df = result_df.withColumn("routes", from_json("routes", routes_schema))
+    result_df.show(20, False)
 
     spark.stop()
