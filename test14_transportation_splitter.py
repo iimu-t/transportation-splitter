@@ -128,15 +128,11 @@ class SplitterDataWrangler:
 
         write_path = self.default_path_for_step(step)
         print(f"Calling default write for step {step} at {write_path}")
-        # raw_split では parquet として書き出す
-        if step == SplitterStep.raw_split:
-            SplitterDataWrangler.write_parquet(df, write_path)
-        else:
-            # geometry 列が存在しない場合、geometry_wkt から生成する（パーサーはそのまま使用）
-            if "geometry" not in df.columns and "geometry_wkt" in df.columns:
-                df = df.withColumn("geometry", expr("ST_GeomFromWKT(geometry_wkt)"))
-            # 常にparquet形式で書き出す
-            SplitterDataWrangler.write_parquet(df, write_path)
+        # raw_split でも geometry 列が存在しない場合、geometry_wkt から生成する
+        if "geometry" not in df.columns and "geometry_wkt" in df.columns:
+            df = df.withColumn("geometry", expr("ST_GeomFromWKT(geometry_wkt)"))
+        # 常にparquet形式で書き出す
+        SplitterDataWrangler.write_parquet(df, write_path)
 
     def default_path_for_step(self, step: SplitterStep) -> str:
         return self.input_path if step == SplitterStep.read_input else self.output_path_prefix + "_" + step.value
@@ -884,6 +880,23 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
     def split_segment(input_segment):
         start = timer()
         debug_messages = []
+
+        # 追加: geometry の型が LineString でない場合、型に応じた変換を実施する
+        if not isinstance(input_segment.geometry, LineString):
+            try:
+                if isinstance(input_segment.geometry, (bytes, bytearray)):
+                    # バイナリの場合、WKBからジオメトリを生成し、その WKT を再度読み込むことで LineString に変換する
+                    tmp_geom = shapely.wkb.loads(input_segment.geometry)
+                    input_segment.geometry = wkt.loads(tmp_geom.wkt)
+                elif isinstance(input_segment.geometry, str):
+                    # 文字列の場合は WKT として読み込む
+                    input_segment.geometry = wkt.loads(input_segment.geometry)
+                else:
+                    raise Exception(f"Unsupported geometry type: {type(input_segment.geometry)}")
+            except Exception as e:
+                raise Exception(f"geometry conversion error: {e}")
+                
+        debug_messages.append("type(input_segment.geometry): " + str(type(input_segment.geometry)))
         length_before_split = 0.0
         length_after_split = 0.0
         try:
@@ -964,6 +977,13 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
             exception_traceback = traceback.format_exc().splitlines() # e
             split_segments_rows = []
             added_connectors_rows = []
+        # デバッグ用：split_segments_rows と added_connectors_rows のデータ型と件数をログ出力
+        debug_messages.append("split_segments_rows type: " + str(type(split_segments_rows)) + ", count: " + str(len(split_segments_rows)))
+        debug_messages.append("added_connectors_rows type: " + str(type(added_connectors_rows)) + ", count: " + str(len(added_connectors_rows)))
+
+        # 追加: 各要素を明示的にRowでラップする処理
+        split_segments_rows = [Row(**s) if not isinstance(s, Row) else s for s in split_segments_rows]
+        added_connectors_rows = [Row(**a) if not isinstance(a, Row) else a for a in added_connectors_rows]
 
         end = timer()
         elapsed = end - start
@@ -1133,7 +1153,7 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
         split_segments_df = split_joined_segments(sc, joined_df, lr_columns_for_splitting, cfg)
         wrangler.write(split_segments_df, SplitterStep.raw_split)
     else:
-        split_segments_df = wrangler.write(spark, SplitterStep.raw_split)
+        split_segments_df = wrangler.read(spark, SplitterStep.raw_split)
 
     print(f"split_segments_df.count() = {str(split_segments_df.count())}")
 
@@ -1210,7 +1230,7 @@ def custom_read_hook_example(spark: SparkSession, step: SplitterStep, base_path:
     if "geometry" not in df.columns and "geometry_wkt" in df.columns:
         # 明示的に文字列にキャスト→一時カラムに格納→変換
         df = df.withColumn("geometry_raw", col("geometry_wkt").cast(StringType()))
-        df = df.withColumn("geometry", st_geomfromwkt_udf(col("geometry_raw")))
+        df = df.withColumn("geometry", st_astext_udf(st_geomfromwkt_udf(col("geometry_raw"))))
         # 変換結果がNULLの場合はフィルターで除外（またはログ出力）
         df = df.filter(col("geometry").isNotNull())
         # 不要な一時カラムを削除
@@ -1267,7 +1287,8 @@ def custom_write_hook_example(df: DataFrame, step: SplitterStep, base_path: str)
              .option("parquet.block.size", 16 * 1024 * 1024) \
              .save(base_path)
     else:
-         SplitterDataWrangler.write_geoparquet(df, base_path)
+         # Always write as parquet
+         SplitterDataWrangler.write_parquet(df, base_path)
 
 # 追加: ST_GeomFromWKT 関数を定義して UDF として登録
 def st_geomfromwkt(wkt_text: str):
@@ -1275,11 +1296,12 @@ def st_geomfromwkt(wkt_text: str):
         return None
     try:
         geom = wkt.loads(wkt_text)
-        return geom.wkb  # シャピ―オブジェクトではなくWKB (bytes)を返す
+        # Return geometry WKB as memoryview for proper BinaryType serialization
+        return bytes(geom.wkb)
     except Exception:
         return None
 
-# UDFの戻り値の型をBinaryType()に変更
+# UDF登録時、返り値型をBinaryTypeに指定
 st_geomfromwkt_udf = udf(st_geomfromwkt, BinaryType())
 
 # 追加: ST_AsText 関数を定義して UDF として登録
