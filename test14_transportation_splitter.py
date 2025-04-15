@@ -11,7 +11,7 @@ from enum import Enum
 from pyspark.sql.functions import expr, lit, col, explode, collect_list, struct, udf, struct, count, size, split, element_at, coalesce, round as _round, from_json
 from pyspark.sql.types import *
 from pyspark.sql.utils import AnalysisException
-from pyspark.sql import DataFrame, functions as F, SparkSession
+from pyspark.sql import DataFrame, functions as F, SparkSession, Row
 import pyproj
 from shapely.geometry import Point, LineString
 from shapely import wkt
@@ -28,6 +28,7 @@ from sedona.spark import SedonaContext
 import re
 from pyspark.sql.functions import udf
 from pyspark.sql.types import StringType, BinaryType
+
 
 # 追加: "connectors" 列をJSON形式に変換するための関数とUDF定義
 def fix_connectors_json(s: str) -> str:
@@ -977,13 +978,6 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
             exception_traceback = traceback.format_exc().splitlines() # e
             split_segments_rows = []
             added_connectors_rows = []
-        # デバッグ用：split_segments_rows と added_connectors_rows のデータ型と件数をログ出力
-        debug_messages.append("split_segments_rows type: " + str(type(split_segments_rows)) + ", count: " + str(len(split_segments_rows)))
-        debug_messages.append("added_connectors_rows type: " + str(type(added_connectors_rows)) + ", count: " + str(len(added_connectors_rows)))
-
-        # 追加: 各要素を明示的にRowでラップする処理
-        split_segments_rows = [Row(**s) if not isinstance(s, Row) else s for s in split_segments_rows]
-        added_connectors_rows = [Row(**a) if not isinstance(a, Row) else a for a in added_connectors_rows]
 
         end = timer()
         elapsed = end - start
