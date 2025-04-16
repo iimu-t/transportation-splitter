@@ -881,7 +881,7 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
     def split_segment(input_segment):
         start = timer()
         debug_messages = []
-
+        
         # 追加: geometry の型が LineString でない場合、型に応じた変換を実施する
         if not isinstance(input_segment.geometry, LineString):
             try:
@@ -1222,14 +1222,9 @@ def custom_read_hook_example(spark: SparkSession, step: SplitterStep, base_path:
 
     # geometry 列が存在しない場合は、geometry_wkt から geometry 列へ変換する
     if "geometry" not in df.columns and "geometry_wkt" in df.columns:
-        # 明示的に文字列にキャスト→一時カラムに格納→変換
-        df = df.withColumn("geometry_raw", col("geometry_wkt").cast(StringType()))
-        df = df.withColumn("geometry", st_astext_udf(st_geomfromwkt_udf(col("geometry_raw"))))
-        # 変換結果がNULLの場合はフィルターで除外（またはログ出力）
-        df = df.filter(col("geometry").isNotNull())
-        # 不要な一時カラムを削除
-        df = df.drop("geometry_raw")
-
+        # WKT形式をWKB形式に変換
+        df = df.withColumn("geometry", st_geomfromwkt_udf(col("geometry_wkt")))
+        
     # connectors 列を解析して同じ名称で上書き
     connectors_schema = ArrayType(StructType([
         StructField("connector_id", StringType(), True),
@@ -1266,7 +1261,6 @@ def custom_read_hook_example(spark: SparkSession, step: SplitterStep, base_path:
         StructField("between", ArrayType(DoubleType()), True)
     ]))
     df = df.withColumn("prohibited_transitions", from_json(col("prohibited_transitions"), prohibited_transitions_schema))
-    
     return df
 
 # 追加: カスタム exists hook のサンプル
@@ -1284,8 +1278,8 @@ def custom_write_hook_example(df: DataFrame, step: SplitterStep, base_path: str)
          # Always write as parquet
          SplitterDataWrangler.write_parquet(df, base_path)
 
-# 追加: ST_GeomFromWKT 関数を定義して UDF として登録
-def st_geomfromwkt(wkt_text: str):
+# 追加: ST_GeomFromWKT 関数を定義して PySpark UDF として登録
+def ST_GeomFromWKT(wkt_text: str):
     if wkt_text is None:
         return None
     try:
@@ -1295,11 +1289,10 @@ def st_geomfromwkt(wkt_text: str):
     except Exception:
         return None
 
-# UDF登録時、返り値型をBinaryTypeに指定
-st_geomfromwkt_udf = udf(st_geomfromwkt, BinaryType())
+st_geomfromwkt_udf = udf(ST_GeomFromWKT, BinaryType())
 
-# 追加: ST_AsText 関数を定義して UDF として登録
-def st_astext(wkb_bin):
+# 追加: ST_AsText 関数を定義して PySpark UDF として登録
+def ST_AsText(wkb_bin):
     if wkb_bin is None:
         return None
     try:
@@ -1308,7 +1301,7 @@ def st_astext(wkb_bin):
     except Exception:
         return None
 
-st_astext_udf = udf(st_astext, StringType())
+st_astext_udf = udf(ST_AsText, StringType())
 
 # COMMAND ----------
 if __name__ == "__main__":
