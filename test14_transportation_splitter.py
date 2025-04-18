@@ -881,7 +881,7 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
     def split_segment(input_segment):
         start = timer()
         debug_messages = []
-        
+        '''
         # 追加: geometry の型が LineString でない場合、型に応じた変換を実施する
         if not isinstance(input_segment.geometry, LineString):
             try:
@@ -896,6 +896,7 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
                     raise Exception(f"Unsupported geometry type: {type(input_segment.geometry)}")
             except Exception as e:
                 raise Exception(f"geometry conversion error: {e}")
+        '''
                 
         debug_messages.append("type(input_segment.geometry): " + str(type(input_segment.geometry)))
         length_before_split = 0.0
@@ -949,6 +950,7 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
             #debug_messages.append("splitting into segments...")
             split_segments = split_line(input_segment.geometry, sorted_split_points)
             length_after_split = 0.0
+
             for split_segment in split_segments:
                 split_length = get_length(split_segment.geometry)
                 length_after_split += split_length
@@ -1114,6 +1116,8 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
 
     if filter_wkt is None:
         filtered_df = wrangler.read(spark, SplitterStep.read_input)
+        print("filtered_df type counts:")
+        filtered_df.groupBy("type").count().show()
     else:
         # Step 1 Filter only features that intersect with given polygon wkt
         if not wrangler.check_exists(spark, SplitterStep.spatial_filter) or not cfg.reuse_existing_intermediate_outputs:
@@ -1181,7 +1185,6 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
     # Output error count, example errors and split stats to identify potential issues
     final_segments_df.groupBy("is_success", coalesce(element_at(split(final_segments_df["error_message"], ":"), 1), "error_message")).agg(count("*").alias("count")).show(20, False)
     final_segments_df.groupBy("id").agg(count("*").alias("number_of_splits")).groupBy("number_of_splits").agg(count("*")).orderBy("number_of_splits").show()
-
     all_connectors_df = filtered_df.filter("type == 'connector'").unionByName(added_connectors_df).select(filtered_df.columns)
     if PROHIBITED_TRANSITIONS_COLUMN in final_segments_df.columns:
         final_segments_df = resolve_tr_references(final_segments_df)
@@ -1210,7 +1213,10 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
 
 # Example custom_read_hook
 def custom_read_hook_example(spark: SparkSession, step: SplitterStep, base_path: str) -> DataFrame:
-    df = spark.read.option("mergeSchema", "true").parquet(base_path)
+    print(f"Base_path: {base_path}")
+    df = spark.read.option("mergeSchema", "false").parquet(base_path)
+    df.groupBy("type").count().show()
+    print(f"Row count: {df.count()}")
 
     # connectors列が文字列の場合、fix_connectors_udfを適用してJSON形式に変換する
     if "connectors" in df.columns:
@@ -1311,11 +1317,19 @@ if __name__ == "__main__":
     parser.add_argument("--input", type=str, required=True, help="Input path (e.g., s3a://...)")
     parser.add_argument("--output", type=str, required=True, help="Output path prefix (e.g., s3a://...)")
     parser.add_argument("--wkt_filter", type=str, default=None, help="WKT polygon filter (optional)")
+    parser.add_argument("--split-at-connectors", dest="split_at_connectors", action="store_true",
+                        help="Flag to split at connectors (default: True)")
+    parser.add_argument("--split-at-lr-columns", type=str, default=None,
+                        help="Comma-separated list of column names to include for LR splitting (optional)")
+
     args = parser.parse_args()
 
     spark = SparkSession.builder \
         .appName("Transportation Splitter") \
+        .config("spark.serializer", "org.apache.spark.serializer.KryoSerializer") \
+        .config("spark.kryo.registrator", "org.apache.sedona.core.serde.SedonaKryoRegistrator") \
         .getOrCreate()
+
     spark.udf.register("ST_GeomFromWKT", st_geomfromwkt_udf)
     spark.udf.register("ST_AsText", st_astext_udf)
     sc = spark.sparkContext
@@ -1327,6 +1341,7 @@ if __name__ == "__main__":
         custom_exists_hook=custom_exists_hook_example,
         custom_write_hook=custom_write_hook_example
     )
+
     result_df = split_transportation(spark, sc, wrangler, args.wkt_filter)
     result_df.show(20, False)
     spark.stop()
