@@ -51,7 +51,8 @@ def fix_prohibited_transitions_json(s: str) -> str:
 
 fix_prohibited_transitions_udf = udf(fix_prohibited_transitions_json, StringType())
 
-PROHIBITED_TRANSITIONS_COLUMN = "prohibited_transitions"
+#PROHIBITED_TRANSITIONS_COLUMN = "prohibited_transitions"
+PROHIBITED_TRANSITIONS_COLUMN = "routes"
 DESTINATIONS_COLUMN = "destinations"
 LR_SCOPE_KEY = "between"
 """
@@ -229,7 +230,7 @@ class SplitConfig:
     """
     Skips steps for which intermediate streams are found, default True, set to False to always force reprocess all sub-steps 
     """
-    reuse_existing_intermediate_outputs: bool = True
+    reuse_existing_intermediate_outputs: bool = False # True から変更
 DEFAULT_CFG = SplitConfig()
 
 @dataclass
@@ -1145,13 +1146,15 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
 
     print(f"joined_df.count() = {str(joined_df.count())}")
 
-    # Step 3 Split segments applying UDF on each segment+its connectors
+    # Step 3 Split segments applying UDF on each segment+its connectors →cfg.reuse_existing_intermediate_outputs のデフォルト値をFalse に設定
     if not wrangler.check_exists(spark, SplitterStep.raw_split) or not cfg.reuse_existing_intermediate_outputs:
-        print(f"split_joined_segments()...")
+        print(f"split_joined_segments()...if")
         split_segments_df = split_joined_segments(sc, joined_df, lr_columns_for_splitting, cfg)
         wrangler.write(split_segments_df, SplitterStep.raw_split)
     else:
+        print(f"split_joined_segments()...else")
         split_segments_df = wrangler.read(spark, SplitterStep.raw_split)
+        split_segments_df.printSchema()
 
     print(f"split_segments_df.count() = {str(split_segments_df.count())}")
 
@@ -1271,7 +1274,10 @@ def custom_read_hook_example(spark: SparkSession, step: SplitterStep, base_path:
 
 # 追加: カスタム exists hook のサンプル
 def custom_exists_hook_example(spark: SparkSession, step: SplitterStep, base_path: str) -> bool:
-    return SplitterDataWrangler.parquet_exists(spark, base_path)
+    print(f"Checking existence for step {step} at path: {base_path}")
+    exists = SplitterDataWrangler.parquet_exists(spark, base_path)
+    print(f"Parquet exists at {base_path}: {exists}")
+    return exists
 
 # 追加: カスタム write hook のサンプル
 def custom_write_hook_example(df: DataFrame, step: SplitterStep, base_path: str) -> None:

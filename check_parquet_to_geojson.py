@@ -7,7 +7,7 @@ import numpy as np
 
 # 定数
 #S3_INPUT_PATH = "s3://overturemaps-data/splitter_output/exp_con.parquet"
-S3_INPUT_PATH = "s3://overturemaps-data/splitter_results_4_segments_splits/part-00000-7f1fd6b4-3750-4304-91de-b00019d71f34-c000.zstd.parquet"
+S3_INPUT_PATH = "s3://overturemaps-data/splitter_results/part-00000-b33114bc-20b9-4581-aa09-7b30236fa821-c000.zstd.parquet"
 OUTPUT_GEOJSON = "./output.geojson"
 
 def main():
