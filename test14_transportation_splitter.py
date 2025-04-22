@@ -51,8 +51,19 @@ def fix_prohibited_transitions_json(s: str) -> str:
 
 fix_prohibited_transitions_udf = udf(fix_prohibited_transitions_json, StringType())
 
-#PROHIBITED_TRANSITIONS_COLUMN = "prohibited_transitions"
-PROHIBITED_TRANSITIONS_COLUMN = "routes"
+# 追加: "destinations" 列を JSON 形式に変換するための関数と UDF
+def fix_destinations_json(s: str) -> str:
+    if s is None:
+        return None
+    # キーと値をJSON形式に変換
+    s = re.sub(r'(\w+)=', r'"\1":', s)
+    # 必要に応じて追加の置換処理を実施
+    return s
+
+fix_destinations_udf = udf(fix_destinations_json, StringType())
+
+
+PROHIBITED_TRANSITIONS_COLUMN = "prohibited_transitions"
 DESTINATIONS_COLUMN = "destinations"
 LR_SCOPE_KEY = "between"
 """
@@ -1217,31 +1228,26 @@ def split_transportation(spark, sc, wrangler: SplitterDataWrangler, filter_wkt=N
 # Example custom_read_hook
 def custom_read_hook_example(spark: SparkSession, step: SplitterStep, base_path: str) -> DataFrame:
     print(f"Base_path: {base_path}")
-    df = spark.read.option("mergeSchema", "false").parquet(base_path)
+    df = spark.read.option("mergeSchema", "false").parquet(base_path) # True から False に変更
+    print(f"Read {df.count()} rows from {base_path}")
     df.groupBy("type").count().show()
     print(f"Row count: {df.count()}")
-
-    # connectors列が文字列の場合、fix_connectors_udfを適用してJSON形式に変換する
-    if "connectors" in df.columns:
-        df = df.withColumn("connectors", fix_connectors_udf(col("connectors")))
-
-    # prohibited_transitions列が文字列の場合、fix_prohibited_transitions_udfを適用してJSON形式に変換する
-    if "prohibited_transitions" in df.columns:
-        df = df.withColumn("prohibited_transitions", fix_prohibited_transitions_udf(col("prohibited_transitions")))
 
     # geometry 列が存在しない場合は、geometry_wkt から geometry 列へ変換する
     if "geometry" not in df.columns and "geometry_wkt" in df.columns:
         # WKT形式をWKB形式に変換
         df = df.withColumn("geometry", st_geomfromwkt_udf(col("geometry_wkt")))
         
-    # connectors 列を解析して同じ名称で上書き
+    # connectors列が文字列の場合、fix_connectors_udfを適用してJSON形式に変換する
     connectors_schema = ArrayType(StructType([
         StructField("connector_id", StringType(), True),
         StructField("at", StringType(), True)
     ]))
-    df = df.withColumn("connectors", from_json(col("connectors"), connectors_schema))
+    if "connectors" in df.columns:
+        df = df.withColumn("connectors", fix_connectors_udf(col("connectors")))
+        df = df.withColumn("connectors", from_json(col("connectors"), connectors_schema))
     
-    # prohibited_transitions 列を解析して同じ名称で上書き
+    # prohibited_transitions列が文字列の場合、fix_prohibited_transitions_udfを適用してJSON形式に変換する
     prohibited_transitions_schema = ArrayType(StructType([
         StructField("sequence", ArrayType(
             StructType([
@@ -1269,7 +1275,29 @@ def custom_read_hook_example(spark: SparkSession, step: SplitterStep, base_path:
         ]), True),
         StructField("between", ArrayType(DoubleType()), True)
     ]))
-    df = df.withColumn("prohibited_transitions", from_json(col("prohibited_transitions"), prohibited_transitions_schema))
+    if "prohibited_transitions" in df.columns:
+        df = df.withColumn("prohibited_transitions", fix_prohibited_transitions_udf(col("prohibited_transitions")))
+        df = df.withColumn("prohibited_transitions", from_json(col("prohibited_transitions"), prohibited_transitions_schema))
+
+    # destinations列が文字列の場合、fix_destinations_udfを適用してJSON形式に変換する
+    destinations_schema = ArrayType(StructType([
+        StructField("labels", ArrayType(StructType([
+            StructField("value", StringType(), True),
+            StructField("type", StringType(), True)
+        ])), True),
+        StructField("symbols", ArrayType(StringType()), True),
+        StructField("from_connector_id", StringType(), True),
+        StructField("to_segment_id", StringType(), True),
+        StructField("to_connector_id", StringType(), True),
+        StructField("when", StructType([
+            StructField("heading", StringType(), True)
+        ]), True),
+        StructField("final_heading", StringType(), True)
+    ]))
+    if "destinations" in df.columns:
+        df = df.withColumn("destinations", fix_destinations_udf(col("destinations")))
+        df = df.withColumn("destinations", from_json(col("destinations"), destinations_schema))
+
     return df
 
 # 追加: カスタム exists hook のサンプル
