@@ -893,23 +893,28 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
     def split_segment(input_segment):
         start = timer()
         debug_messages = []
-        '''
+
+
+
         # 追加: geometry の型が LineString でない場合、型に応じた変換を実施する
         if not isinstance(input_segment.geometry, LineString):
             try:
                 if isinstance(input_segment.geometry, (bytes, bytearray)):
                     # バイナリの場合、WKBからジオメトリを生成し、その WKT を再度読み込むことで LineString に変換する
-                    tmp_geom = shapely.wkb.loads(input_segment.geometry)
-                    input_segment.geometry = wkt.loads(tmp_geom.wkt)
+                    input_segment.geometry = shapely.wkb.loads(input_segment.geometry)
                 elif isinstance(input_segment.geometry, str):
                     # 文字列の場合は WKT として読み込む
                     input_segment.geometry = wkt.loads(input_segment.geometry)
+                elif isinstance(input_segment.geometry, list):
+                    input_segment.geometry = shapely.wkb.loads(bytes(input_segment.geometry))
                 else:
                     raise Exception(f"Unsupported geometry type: {type(input_segment.geometry)}")
             except Exception as e:
                 raise Exception(f"geometry conversion error: {e}")
-        '''
-                
+
+
+
+
         debug_messages.append("type(input_segment.geometry): " + str(type(input_segment.geometry)))
         length_before_split = 0.0
         length_after_split = 0.0
@@ -1309,6 +1314,15 @@ def custom_exists_hook_example(spark: SparkSession, step: SplitterStep, base_pat
 
 # 追加: カスタム write hook のサンプル
 def custom_write_hook_example(df: DataFrame, step: SplitterStep, base_path: str) -> None:
+    # 例: default_path_for_step を使って出力パスを算出
+    write_path = base_path + "_" + step.value
+    print(f"Custom write hook: writing to {write_path}")
+    df.write.format("parquet") \
+        .option("compression", "zstd") \
+        .mode("overwrite") \
+        .save(write_path)
+'''        
+def custom_write_hook_example(df: DataFrame, step: SplitterStep, base_path: str) -> None:
     if step == SplitterStep.raw_split:
          df.write.format("parquet").mode("overwrite") \
              .option("compression", "zstd") \
@@ -1317,7 +1331,7 @@ def custom_write_hook_example(df: DataFrame, step: SplitterStep, base_path: str)
     else:
          # Always write as parquet
          SplitterDataWrangler.write_parquet(df, base_path)
-
+'''
 # 追加: ST_GeomFromWKT 関数を定義して PySpark UDF として登録
 def ST_GeomFromWKT(wkt_text: str):
     if wkt_text is None:
@@ -1367,7 +1381,7 @@ if __name__ == "__main__":
     spark.udf.register("ST_GeomFromWKT", st_geomfromwkt_udf)
     spark.udf.register("ST_AsText", st_astext_udf)
     sc = spark.sparkContext
-
+    
     wrangler = SplitterDataWrangler(
         input_path=args.input,
         output_path_prefix=args.output,
