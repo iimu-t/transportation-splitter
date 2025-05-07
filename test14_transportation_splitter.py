@@ -28,7 +28,7 @@ from sedona.spark import SedonaContext
 import re
 from pyspark.sql.functions import udf
 from pyspark.sql.types import StringType, BinaryType
-
+from pyspark.sql.functions import udf, col
 
 # 追加: "connectors" 列をJSON形式に変換するための関数とUDF定義
 def fix_connectors_json(s: str) -> str:
@@ -899,17 +899,34 @@ def split_joined_segments(sc, df: DataFrame, lr_columns_for_splitting: list[str]
         # 追加: geometry の型が LineString でない場合、型に応じた変換を実施する
         if not isinstance(input_segment.geometry, LineString):
             try:
-                if isinstance(input_segment.geometry, (bytes, bytearray)):
-                    # バイナリの場合、WKBからジオメトリを生成し、その WKT を再度読み込むことで LineString に変換する
-                    input_segment.geometry = shapely.wkb.loads(input_segment.geometry)
-                elif isinstance(input_segment.geometry, str):
-                    # 文字列の場合は WKT として読み込む
-                    input_segment.geometry = wkt.loads(input_segment.geometry)
-                elif isinstance(input_segment.geometry, list):
-                    input_segment.geometry = shapely.wkb.loads(bytes(input_segment.geometry))
+                g = input_segment.geometry
+                # bytes／bytearray → そのまま WKB loads
+                if isinstance(g, (bytes, bytearray)):
+                    input_segment.geometry = shapely.wkb.loads(g)
+
+                # WKT 文字列 → shapely.loads
+                elif isinstance(g, str):
+                    input_segment.geometry = wkt.loads(g)
+
+                # list[int] → bytes → WKB loads
+                elif isinstance(g, list):
+                    input_segment.geometry = shapely.wkb.loads(bytes(g))
+
+                # dict {"0":…,"1":…} になっているケース
+                elif isinstance(g, dict):
+                    # 順序をキーの数値順に揃えてバイト列化
+                    byte_list = [int(g[str(i)]) for i in range(len(g))]
+                    input_segment.geometry = shapely.wkb.loads(bytes(byte_list))
+
+                # int 単体で渡されてしまうレアケース
+                elif isinstance(g, int):
+                    input_segment.geometry = shapely.wkb.loads(bytes([g]))
+
                 else:
-                    raise Exception(f"Unsupported geometry type: {type(input_segment.geometry)}")
+                    raise Exception(f"Unsupported geometry type: {type(g)}")
+
             except Exception as e:
+                # いったん例外内容を含めて落とす
                 raise Exception(f"geometry conversion error: {e}")
 
 
@@ -1242,6 +1259,22 @@ def custom_read_hook_example(spark: SparkSession, step: SplitterStep, base_path:
     if "geometry" not in df.columns and "geometry_wkt" in df.columns:
         # WKT形式をWKB形式に変換
         df = df.withColumn("geometry", st_geomfromwkt_udf(col("geometry_wkt")))
+
+
+
+
+    # parquet 読み込み時に list[int] として来てしまった geometry を bytes に変換
+    if "geometry" in df.columns:
+        df = df.withColumn("geometry", to_bytes_udf(col("geometry")))
+
+
+
+
+
+
+    # geometry 列のデータ型を出力する
+    if "geometry" in df.columns:
+        print("Geometry column data type in schema:", df.schema["geometry"].dataType)
         
     # connectors列が文字列の場合、fix_connectors_udfを適用してJSON形式に変換する
     connectors_schema = ArrayType(StructType([
@@ -1356,6 +1389,14 @@ def ST_AsText(wkb_bin):
         return None
 
 st_astext_udf = udf(ST_AsText, StringType())
+
+# 追加: Python の list や bytearray を必ず bytes に直す UDF
+def _to_bytes(x):
+    if isinstance(x, list) or isinstance(x, bytearray):
+        return bytes(x)
+    return x  # すでに bytes ならそのまま、その他は None や異常値としてスルー
+
+to_bytes_udf = udf(_to_bytes, BinaryType())
 
 # COMMAND ----------
 if __name__ == "__main__":
