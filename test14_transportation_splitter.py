@@ -1267,6 +1267,14 @@ def custom_read_hook_example(spark: SparkSession, step: SplitterStep, base_path:
     if "geometry" in df.columns:
         df = df.withColumn("geometry", to_bytes_udf(col("geometry")))
 
+    # geometry列がbytes/list/etc.どの型で来ているか確認
+    if "geometry" in df.columns:
+        # スキーマ上の型を表示
+        print("Geometry column Spark dataType:", df.schema["geometry"].dataType)
+        # 実際にPython側で扱われるオブジェクトの型をサンプル1件で表示
+        sample_geom = df.select("geometry").head()[0]
+        print("Geometry column Python object type:", type(sample_geom))
+
 
 
 
